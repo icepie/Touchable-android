@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """Translate captured Switch shaders to validated Vulkan SPIR-V modules for Android.
 
-The output keeps the translator's SPIR-V. The host compiles pipelines at run time.
+Two output contracts share one capture source:
+
+* touchable: per-chain directories with a manifest. Keep this as the baseline
+  for tool comparison. It does not run on the akari host.
+* akari: a flat cache of <key>.spv plus binary <key>.meta files, produced by the
+  pinned akari-android translator. The Android host loads this cache as
+  $DM_VK_SHADERS. The key rule is the capture key (control plus code when the
+  profile sets SS_SHADER_KEY_CODE); the akari key derivation is patched to match.
+
 A lower-left window origin is applied by the host with a negative-viewport transform,
 not by a shader flip, so no --flip-vert-y pass runs here.
 """
@@ -59,24 +67,81 @@ def tool_fingerprint(config, validator):
     return fingerprint
 
 
+def build_akari(args, jobs, out, work, validator):
+    """Write akari-contract jobs and run the pinned translator driver.
+
+    The driver at dm/android/tools/build_shaders.py builds its own patched
+    translator, emits <key>.spv plus binary <key>.meta files, and writes
+    host-subgroup-size.txt. Its cache directory is <out>/spirv. The job keys
+    are the capture keys; the host key derivation is patched to match, so do
+    not let the driver re-key anything (--reuse-jobs passes keys through).
+    """
+    sets = dict(vs=0, ps=1, gs=2, hs=3, ds=4, cs=0)
+    converted = []
+    for job in jobs:
+        if job['stage'] not in sets:
+            raise GameError('The akari host has no pipeline stage ' + job['stage'] + '.')
+        entry = dict(key=job['key'], stage=job['stage'], code=f"{job['key']}.bin",
+                     c1=job['c1'], tex=job['tex'], img=job['img'], attr=job['attr'],
+                     fout=job['fout'], debug=False, reduced=False,
+                     set=sets[job['stage']], host_subgroup_size=args.host_subgroup_size,
+                     shared=job.get('shared', 0))
+        if 'local' in job:
+            entry['local'] = job['local']
+        converted.append(entry)
+    work.mkdir(parents=True, exist_ok=True)
+    (work / 'jobs.json').write_text(json.dumps(converted, indent=2) + '\n')
+    # shader_job() already wrote each {key}.bin next to the jobs file.
+    driver = args.akari / 'dm/android/tools/build_shaders.py'
+    if not driver.is_file():
+        raise GameError('No akari-android tree at ' + str(args.akari) + '.')
+    opt = validator.with_name('spirv-opt')
+    command = [sys.executable, driver, out, '--reuse-jobs', work / 'jobs.json',
+               '--dotnet', args.dotnet, '--host-subgroup-size', str(args.host_subgroup_size),
+               '--jobs', str(args.jobs), '--validate', '--spirv-val', validator, '--spirv-opt', opt]
+    if args.no_driver_variants:
+        command.append('--no-driver-variants')
+    print(run(command), flush=True)
+    cache = out / 'spirv'
+    spv = sorted(cache.glob('*.spv'))
+    if len(spv) < len(converted):
+        raise GameError('The akari driver produced ' + str(len(spv)) + ' modules for '
+                        + str(len(converted)) + ' shaders.')
+    missing_meta = [p.stem for p in spv if not p.with_suffix('.meta').is_file()]
+    if missing_meta:
+        raise GameError('Missing reflection for: ' + ', '.join(missing_meta) + '.')
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--jobs', type=int, default=8, help='Parallel translation jobs.')
     parser.add_argument('--game', default='silksong', help='Registered game ID.')
     parser.add_argument('--capture', type=Path, help='Default: work/<game>/shaders/capture.')
     parser.add_argument('--out', type=Path, help='Default: work/<game>/shaders-android.')
     parser.add_argument('--validator', type=Path, help='Default: D2R_SHADER_TOOLS/spirv-val or the NDK shader-tools.')
+    parser.add_argument('--contract', choices=('touchable', 'akari'), default='touchable',
+                        help='Output contract. akari builds the cache the Android host loads.')
+    parser.add_argument('--akari', type=Path, default=DEPENDENCIES / 'akari-android',
+                        help='Pinned akari-android tree with the patched translator.')
+    parser.add_argument('--dotnet', type=Path, default=Path('/usr/bin/dotnet'),
+                        help='dotnet for the akari translator build (net10.0).')
+    parser.add_argument('--host-subgroup-size', type=int, choices=(32, 64, 128), default=64,
+                        help='Device Vulkan subgroup size for the akari contract (default 64, Adreno 6xx).')
+    parser.add_argument('--no-driver-variants', action='store_true',
+                        help='Skip the akari per-driver SPIR-V variants.')
     args = parser.parse_args()
     config = load_game(args.game)
     if config.require_adapted('shader_build') not in ('unity-nvn', 'nvn'):
         raise GameError('No shader build implementation is registered for ' + config.id + '.')
     validator = validator_path(args.validator)
     capture = (args.capture or config.capture_dir).resolve()
-    out = (args.out or config.work_dir / 'shaders-android').resolve()
+    default_out = 'shaders-android-akari' if args.contract == 'akari' else 'shaders-android'
+    out = (args.out or config.work_dir / default_out).resolve()
     controls = sorted(capture.glob('*.control'))
     if not controls:
         raise GameError('No captured shaders were found: ' + str(capture))
-    work = out / 'translate'
+    work = out / ('jobs-src' if args.contract == 'akari' else 'translate')
     work.mkdir(parents=True, exist_ok=True)
+
     fingerprint = tool_fingerprint(config, validator)
     origin = config.profile.get('nvn_window_origin', 'upper-left')
     if origin not in ('upper-left', 'lower-left'):
@@ -93,6 +158,10 @@ def main():
     for job in jobs:
         if job['stage'] == 'vs':
             job['attr'] = dict(attribute_types)
+
+    if args.contract == 'akari':
+        build_akari(args, jobs, out, work, validator)
+        return
     jobs_file = work / 'jobs.json'
     jobs_file.write_text(json.dumps(jobs, indent=2) + '\n')
     print(run([DEPENDENCIES / 'dotnet/dotnet', XLATE / 'dmsh_xlate.dll', jobs_file, work]).strip(), flush=True)

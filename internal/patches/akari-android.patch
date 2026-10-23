@@ -1,0 +1,55 @@
+diff --git a/dm/android/native/nvn_vulkan_shader.inc b/dm/android/native/nvn_vulkan_shader.inc
+index 008169d..6e53aac 100644
+--- a/dm/android/native/nvn_vulkan_shader.inc
++++ b/dm/android/native/nvn_vulkan_shader.inc
+@@ -172,10 +172,14 @@ static shader_entry *shader_load_by_key(const char *key,int stats,int fatal) {
+     pthread_mutex_unlock(&graphics_object_lock);
+     if(stats)resource_create_end(0,creation,s->key,NULL);LOG("[vulkan] shader %s stage=%u bindings=%u dynamic_uniforms=%u variant=%s",s->key,s->stage,s->count,s->dynamic_count,variant?shader_variant.id:"base");return s;
+ }
+-// 运行期入口：控制块哈希出键，命中共享表或走致命加载；预热入口按清单键非致命加载。
+-// Runtime entry: hash the control block to a key, then hit the shared table or load fatally; the warm entry loads non-fatally by manifest key.
+-static shader_entry *shader_get(const void *control) {
+-    uint8_t hash[32];dm_android_sha256_context ctx;dm_android_sha256_init(&ctx);dm_android_sha256_update(&ctx,control,0x880);dm_android_sha256_final(hash,&ctx);char key[17];for(int i=0;i<8;i++)snprintf(key+i*2,3,"%02x",hash[i]);
++
++// 运行期入口：与离线捕获同一键规则——控制块加代码段一起哈希（有的游戏在多个代码段间复用同一控制块）；命中共享表或走致命加载；预热入口按清单键非致命加载。
++// Runtime entry: the same key rule as the offline capture - hash the control block together with the code segment
++// (some games reuse one control block across several code blobs); hit the shared table or load fatally; the warm entry loads non-fatally by manifest key.
++static shader_entry *shader_get(const void *control,uint64_t code_address) {
++    uint32_t c1_offset,code_size;memcpy(&c1_offset,(const uint8_t*)control+0x700,4);memcpy(&code_size,(const uint8_t*)control+0x704,4);
++    if(memcmp(control,"" "\x34\x12" "\x76\x98",4)||!code_size||code_size>4*1024*1024||c1_offset>code_size)die("Unexpected shader control format: offset=%#x size=%#x",c1_offset,code_size);
++    uint8_t hash[32];dm_android_sha256_context ctx;dm_android_sha256_init(&ctx);dm_android_sha256_update(&ctx,control,0x880);dm_android_sha256_update(&ctx,(const uint8_t*)(uintptr_t)code_address,code_size);dm_android_sha256_final(hash,&ctx);char key[17];for(int i=0;i<8;i++)snprintf(key+i*2,3,"%02x",hash[i]);
+     return shader_load_by_key(key,1,1);
+ }
+ // ProgramSetShaders 每次生成新序号；按程序地址及序号复用解析，防地址重用返回旧着色器。
+@@ -184,11 +188,11 @@ typedef struct resolved_program { const prog_t *program; uint64_t serial; shader
+ static resolved_program *program_index[1024];
+ static shader_entry *program_shader(const prog_t *program,unsigned index) {
+     if(index>=program->nstage||index>=6)die("Vulkan program stage bounds");
+-    if(!program->serial)return shader_get(program->sd[index].control);
++    if(!program->serial)return shader_get(program->sd[index].control,program->sd[index].data);
+     unsigned bucket=((uintptr_t)program>>4)&1023;resolved_program *entry=program_index[bucket];while(entry&&entry->program!=program)entry=entry->next;
+     if(!entry){entry=calloc(1,sizeof *entry);if(!entry)die("Vulkan program cache allocation");entry->program=program;entry->next=program_index[bucket];program_index[bucket]=entry;}
+     if(entry->serial!=program->serial){entry->serial=program->serial;memset(entry->shaders,0,sizeof entry->shaders);}
+-    if(!entry->shaders[index])entry->shaders[index]=shader_get(program->sd[index].control);return entry->shaders[index];
++    if(!entry->shaders[index])entry->shaders[index]=shader_get(program->sd[index].control,program->sd[index].data);return entry->shaders[index];
+ }
+ static void program_remove(const prog_t *program) {
+     unsigned bucket=((uintptr_t)program>>4)&1023;resolved_program **link=&program_index[bucket];while(*link&&(*link)->program!=program)link=&(*link)->next;
+diff --git a/dm/verify/equiv.py b/dm/verify/equiv.py
+index a41a199..d864782 100644
+--- a/dm/verify/equiv.py
++++ b/dm/verify/equiv.py
+@@ -262,7 +262,12 @@ def state(u, st, patched):
+     tp = u.reg_read(UC_ARM64_REG_TPIDR_EL0)
+     if patched: g[18] = struct.unpack('<Q', u.mem_read(TSD + 8 * SLOT18, 8))[0]; tp = struct.unpack('<Q', u.mem_read(TSD + 8 * SLOTTLS, 8))[0]
+     g = g + [tp]
+-    w = [x for x in st['w'] if not (patched and TSD <= x[0] < TSD + 0x10000)]
++    # 槽页在两侧都视作宿主私有：kind=1 的随机客寄存器能让客方 store 落进 [TSD, TSD+0x10000)（sdk 0x32ba58 即此），
++    # 只排除补丁侧会把同一笔写在原侧留成假分歧。槽完整性由上方 g[18]/tp 的槽读回核对，不经写日志。
++    # Treat the slot page as host-private on both sides: a kind=1 random guest register can land a guest store inside
++    # [TSD, TSD+0x10000) (sdk 0x32ba58 is one); excluding only the patched side leaves that same write on the original
++    # side as a false divergence. Slot integrity is verified by the g[18]/tp slot read-back above, not by the write log.
++    w = [x for x in st['w'] if not (TSD <= x[0] < TSD + 0x10000)]
+     return g, u.reg_read(UC_ARM64_REG_SP), u.reg_read(UC_ARM64_REG_NZCV), [u.reg_read(r) for r in VR], w, st['fault']
+ 
+ def run(u, st, start, patched, init):
