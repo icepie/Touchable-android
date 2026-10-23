@@ -10,20 +10,120 @@ import ctypes
 
 SECTOR_SIZE = 0x200
 _ENCRYPT, _DECRYPT = 0, 1
-_crypto = ctypes.CDLL("/usr/lib/system/libcommonCrypto.dylib")
-_crypto.CCCrypt.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_size_t,
+
+
+def _load_crypto():
+    """Return AES-128 ECB and CTR functions for the host system."""
+    try:
+        return _commoncrypto_backend()
+    except OSError:
+        return _openssl_backend()
+
+
+def _commoncrypto_backend():
+    lib = ctypes.CDLL("/usr/lib/system/libcommonCrypto.dylib")
+    lib.CCCrypt.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_size_t,
                             ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t,
                             ctypes.POINTER(ctypes.c_size_t)]
-_crypto.CCCrypt.restype = ctypes.c_int32
+    lib.CCCryptorCreateWithMode.argtypes = [
+        ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_char_p,
+        ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+    lib.CCCryptorCreateWithMode.restype = ctypes.c_int32
+    lib.CCCryptorUpdate.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p,
+                                    ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    lib.CCCryptorUpdate.restype = ctypes.c_int32
+    lib.CCCryptorRelease.argtypes = [ctypes.c_void_p]
+
+    def ecb(operation, key, data):
+        output, moved = ctypes.create_string_buffer(len(data)), ctypes.c_size_t()
+        # kCCAlgorithmAES = 0, kCCOptionECBMode = 2.
+        if lib.CCCrypt(operation, 0, 2, key, len(key), None, data, len(data), output, len(data), ctypes.byref(moved)) \
+                or moved.value != len(data):
+            raise ValueError("AES operation failed.")
+        return output.raw
+
+    def ctr(key, iv, data):
+        reference = ctypes.c_void_p()
+        # kCCDecrypt = 1, kCCModeCTR = 4, kCCAlgorithmAES = 0, ccNoPadding = 0, kCCModeOptionCTR_BE = 2.
+        if lib.CCCryptorCreateWithMode(1, 4, 0, 0, iv, key, len(key), None, 0, 0, 2, ctypes.byref(reference)):
+            raise ValueError("AES operation failed.")
+        try:
+            output, moved = ctypes.create_string_buffer(len(data)), ctypes.c_size_t()
+            if lib.CCCryptorUpdate(reference, data, len(data), output, len(data), ctypes.byref(moved)) \
+                    or moved.value != len(data):
+                raise ValueError("AES operation failed.")
+            return output.raw
+        finally:
+            lib.CCCryptorRelease(reference)
+
+    return ecb, ctr
 
 
-def _aes_ecb(operation, key, data):
-    output, moved = ctypes.create_string_buffer(len(data)), ctypes.c_size_t()
-    # kCCAlgorithmAES = 0, kCCOptionECBMode = 2.
-    if _crypto.CCCrypt(operation, 0, 2, key, len(key), None, data, len(data), output, len(data), ctypes.byref(moved)) \
-            or moved.value != len(data):
-        raise ValueError("AES operation failed.")
-    return output.raw
+def _openssl_backend():
+    lib = None
+    for name in ("libcrypto.so.3", "libcrypto.so"):
+        try:
+            lib = ctypes.CDLL(name)
+            break
+        except OSError:
+            continue
+    if lib is None:
+        raise OSError("No AES backend: CommonCrypto or OpenSSL is required.")
+    lib.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
+    lib.EVP_CIPHER_CTX_free.argtypes = [ctypes.c_void_p]
+    lib.EVP_aes_128_ecb.restype = ctypes.c_void_p
+    lib.EVP_aes_128_ctr.restype = ctypes.c_void_p
+    for name in ("EVP_EncryptInit_ex", "EVP_DecryptInit_ex"):
+        getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                       ctypes.c_char_p, ctypes.c_char_p]
+    lib.EVP_CIPHER_CTX_set_padding.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    for name in ("EVP_EncryptUpdate", "EVP_DecryptUpdate"):
+        getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
+                                       ctypes.c_char_p, ctypes.c_int]
+    for name in ("EVP_EncryptFinal_ex", "EVP_DecryptFinal_ex"):
+        getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+    init = {0: lib.EVP_EncryptInit_ex, 1: lib.EVP_DecryptInit_ex}
+    update = {0: lib.EVP_EncryptUpdate, 1: lib.EVP_DecryptUpdate}
+
+    def ecb(operation, key, data):
+        context = lib.EVP_CIPHER_CTX_new()
+        if not context:
+            raise ValueError("AES operation failed.")
+        try:
+            if init[operation](context, lib.EVP_aes_128_ecb(), None, key, None) != 1 \
+                    or lib.EVP_CIPHER_CTX_set_padding(context, 0) != 1:
+                raise ValueError("AES operation failed.")
+            output = ctypes.create_string_buffer(len(data) + 15)
+            written = ctypes.c_int()
+            # XTS calls this with whole blocks, so one update moves all bytes.
+            if update[operation](context, output, ctypes.byref(written), data, len(data)) != 1 \
+                    or written.value != len(data):
+                raise ValueError("AES operation failed.")
+            return output.raw[:len(data)]
+        finally:
+            lib.EVP_CIPHER_CTX_free(context)
+
+    def ctr(key, iv, data):
+        context = lib.EVP_CIPHER_CTX_new()
+        if not context:
+            raise ValueError("AES operation failed.")
+        try:
+            # OpenSSL CTR increments the whole block as a big-endian integer, as Nintendo does.
+            if lib.EVP_DecryptInit_ex(context, lib.EVP_aes_128_ctr(), None, key, iv) != 1:
+                raise ValueError("AES operation failed.")
+            output = ctypes.create_string_buffer(len(data) + 15)
+            written = ctypes.c_int()
+            if lib.EVP_DecryptUpdate(context, output, ctypes.byref(written), data, len(data)) != 1 \
+                    or written.value != len(data):
+                raise ValueError("AES operation failed.")
+            return output.raw[:len(data)]
+        finally:
+            lib.EVP_CIPHER_CTX_free(context)
+
+    return ecb, ctr
+
+
+_aes_ecb, _aes_ctr = _load_crypto()
 
 
 def xts_aes128(operation, key, data, tweak_value):

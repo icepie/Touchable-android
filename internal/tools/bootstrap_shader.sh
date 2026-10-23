@@ -6,11 +6,15 @@ LOCAL_ROOT="$PROJECT_ROOT/../.touchable"
 DEPENDENCIES="$LOCAL_ROOT/dependencies"
 mkdir -p "$DEPENDENCIES" "$LOCAL_ROOT/build/tooling/downloads" "$LOCAL_ROOT/build/tooling/logs"
 DOTNET_VERSION=10.0.401
-DOTNET_HASH=69f64eb00dc045398755c440b152225d544301a345a146a16e86a56a0c52b7c94b2c331520e976dbb821f18d31930aafbd25bb85961e3517e0665414ce0cbcff
-DOTNET_ARCHIVE="$LOCAL_ROOT/build/tooling/downloads/dotnet-sdk-10.0.401-osx-arm64.tar.gz"
+case "$(uname -s)" in
+    Darwin) DOTNET_OS='osx-arm64'; DOTNET_HASH=69f64eb00dc045398755c440b152225d544301a345a146a16e86a56a0c52b7c94b2c331520e976dbb821f18d31930aafbd25bb85961e3517e0665414ce0cbcff ;;
+    Linux) DOTNET_OS='linux-x64'; DOTNET_HASH=51c8b999af9e8dd9998c9edc5944e19a90788862068acd38694e098889054ce8c23d4f0c5cccfa16bf187d044562359e5ee69a9f8ad0bbe913ba90311fbce25b ;;
+    *) echo 'Unsupported system for the dotnet SDK.' >&2; exit 1 ;;
+esac
+DOTNET_ARCHIVE="$LOCAL_ROOT/build/tooling/downloads/dotnet-sdk-$DOTNET_VERSION-$DOTNET_OS.tar.gz"
 if [[ ! -x "${DEPENDENCIES}/dotnet/dotnet" ]]; then
     curl --fail --location --retry 3 --silent --show-error \
-        "https://builds.dotnet.microsoft.com/dotnet/Sdk/$DOTNET_VERSION/dotnet-sdk-$DOTNET_VERSION-osx-arm64.tar.gz" -o "$DOTNET_ARCHIVE"
+        "https://builds.dotnet.microsoft.com/dotnet/Sdk/$DOTNET_VERSION/dotnet-sdk-$DOTNET_VERSION-$DOTNET_OS.tar.gz" -o "$DOTNET_ARCHIVE"
     ACTUAL_HASH=$(shasum -a 512 "$DOTNET_ARCHIVE" | awk '{print $1}')
     [[ "$ACTUAL_HASH" == "$DOTNET_HASH" ]] || { echo 'Dotnet checksum mismatch' >&2; exit 1; }
     mkdir -p "${DEPENDENCIES}/dotnet"

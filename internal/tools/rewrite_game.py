@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -61,7 +62,11 @@ def main():
             raise GameError("The output already exists. Use --verify-only or select a new --out path.")
         if args.verify_only and not output.is_dir(): raise GameError("The output directory does not exist.")
         environment = os.environ.copy()
-        objdump = subprocess.check_output(["xcrun", "--find", "llvm-objdump"], text=True).strip()
+        try:
+            objdump = subprocess.check_output(["xcrun", "--find", "llvm-objdump"], text=True).strip()
+        except (OSError, subprocess.CalledProcessError):
+            objdump = shutil.which("llvm-objdump") or ""
+            if not objdump: raise GameError("llvm-objdump was not found. Install LLVM, or use Xcode.")
         environment.update(DM_ROOT=str(config.build_dir.parent.parent.parent), DM_VCACHE=str(config.build_dir / "verify-cache"), LLVM_BIN=str(Path(objdump).parent),
                            DM_RULESET="native", DM_PRIVATE_GATES="0", DM_INDIRECT_TRAPS="1")
         log_dir = config.logs_dir / "rewrite"

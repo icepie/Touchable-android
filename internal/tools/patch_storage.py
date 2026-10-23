@@ -18,35 +18,17 @@ from pathlib import Path
 import struct
 
 from game_formats import GameError, read_exact
-from nca_header import SECTOR_SIZE, _DECRYPT, _aes_ecb, _crypto, xts_aes128
+from nca_header import SECTOR_SIZE, _DECRYPT, _aes_ctr, _aes_ecb, xts_aes128
 
 NODE_SIZE = 0x4000
 HEADER_SIZE = 0xC00
 
-_crypto.CCCryptorCreateWithMode.argtypes = [
-    ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_char_p,
-    ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
-_crypto.CCCryptorCreateWithMode.restype = ctypes.c_int32
-_crypto.CCCryptorUpdate.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p,
-                                    ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
-_crypto.CCCryptorUpdate.restype = ctypes.c_int32
-_crypto.CCCryptorRelease.argtypes = [ctypes.c_void_p]
-
-
-def aes_ctr(key, counter, data):
+def aes_ctr(key, iv, data):
     """AES-128-CTR with a 128-bit big-endian counter."""
-    reference = ctypes.c_void_p()
-    # kCCDecrypt = 1, kCCModeCTR = 4, kCCAlgorithmAES = 0, ccNoPadding = 0, kCCModeOptionCTR_BE = 2.
-    if _crypto.CCCryptorCreateWithMode(1, 4, 0, 0, counter, key, len(key), None, 0, 0, 2, ctypes.byref(reference)):
-        raise GameError("AES-CTR setup failed.")
     try:
-        output, moved = ctypes.create_string_buffer(len(data)), ctypes.c_size_t()
-        if _crypto.CCCryptorUpdate(reference, data, len(data), output, len(data), ctypes.byref(moved)) \
-                or moved.value != len(data):
-            raise GameError("AES-CTR decryption failed.")
-        return output.raw
-    finally:
-        _crypto.CCCryptorRelease(reference)
+        return _aes_ctr(key, iv, data)
+    except ValueError as error:
+        raise GameError(str(error))
 
 
 def counter(secure_value, generation, offset):

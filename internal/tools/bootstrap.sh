@@ -38,8 +38,16 @@ if [ ! -f "$DEPENDENCIES/hactool/config.mk" ]; then
 fi
 make -C "$DEPENDENCIES/hactool" -j4 > "$LOCAL_ROOT/build/tooling/logs/hactool-build.log" 2>&1
 if [ ! -x "$LOCAL_ROOT/venv/bin/python" ]; then
-    xcrun python3 -m venv "$LOCAL_ROOT/venv"
+    if command -v xcrun >/dev/null 2>&1; then
+        xcrun python3 -m venv "$LOCAL_ROOT/venv"
+    else
+        python3 -m venv "$LOCAL_ROOT/venv"
+    fi
 fi
 "$LOCAL_ROOT/venv/bin/python" -m pip install -r requirements.txt
-shasum -a 256 requirements.txt | awk '{print $1}' > "$LOCAL_ROOT/venv/.touchable-ready"
+if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 requirements.txt | awk '{print $1}' > "$LOCAL_ROOT/venv/.touchable-ready"
+else
+    sha256sum requirements.txt | awk '{print $1}' > "$LOCAL_ROOT/venv/.touchable-ready"
+fi
 echo "Local preparation tools are ready. This does not build the iOS game."
