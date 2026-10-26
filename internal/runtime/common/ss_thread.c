@@ -1,5 +1,11 @@
 #include "dm.h"
 #include <signal.h>
+#ifdef __ANDROID__
+#include "host_tls.h"
+#define ss_set_guest_slot dm_android_host_setspecific
+#else
+#define ss_set_guest_slot pthread_setspecific
+#endif
 
 extern void dm_gate(void);
 static pthread_key_t allocation_key;
@@ -26,8 +32,8 @@ void guest_thread_init(void) {
     if (!state[0] || !state[1]) die("Cannot allocate guest TLS");
     *(void **)(region + 0x1f8) = region + 0x200;
     if (pthread_setspecific(allocation_key, state) ||
-        pthread_setspecific(g_key18, NULL) ||
-        pthread_setspecific(g_keygate, (void *)dm_gate) ||
-        pthread_setspecific(g_keytls, state[0]) ||
-        pthread_setspecific(g_keytlr, region)) die("Cannot initialize guest thread slots");
+        ss_set_guest_slot(g_key18, NULL) ||
+        ss_set_guest_slot(g_keygate, (void *)dm_gate) ||
+        ss_set_guest_slot(g_keytls, state[0]) ||
+        ss_set_guest_slot(g_keytlr, region)) die("Cannot initialize guest thread slots");
 }

@@ -1,5 +1,31 @@
 # Rhythm Heaven
 
+
+## Linux x64 status
+
+Linux x64 is not a supported host target. The active game modules are AArch64 NSO rewrites. The shared host loads and calls that code directly, and `ss_indirect_branch.c` requires an AArch64 signal context. The current graphics and audio hosts are Android Vulkan/AAudio or Apple Metal/CoreAudio. A Linux x64 port requires an ARM64 emulator or JIT plus Linux Vulkan window and audio backends. No Linux x64 executable was produced.
+
+`qemu-aarch64` alone is not sufficient. It can run an AArch64 Linux process, but it does not provide the Android APIs or the Linux host integration that the current Android source list needs.
+
+The akari-sora Android host now builds a private Rhythm Heaven APK. The game still has status `in-progress`.
+- `internal/tools/build_android.py --game rhythm-heaven --embedded` builds the per-game host from the shared `ss_` services and the `rh_` adapter. It embeds the Android-rewritten `main` and `sdk` modules. It excludes the D2R gameplay and the Metal-only `rh_batch.c` path. The Android package is `com.mmmz.touchablerhythmheaven`; the iOS Bundle ID and save location do not change.
+- The host links NVN/Vulkan, the 35-key SPIR-V cache is prepared in `.touchable/work/rhythm-heaven/shaders-android-akari/spirv/`, and the shared AudioRenderer has an AAudio sink. Rhythm touch events enter through `internal/platform/android/ss_android_touch.c`. Android gamepad rumble reads the shared Switch HID haptic state.
+- A later Redmi K20 Pro Premium build (`RhythmHeaven-android-20261023-145506-127199.apk`) now renders the game's Chinese wireless-headphone warning and drawing. The earlier black picture came from treating immediate NVN texture indices 8 and 10 as c2 byte offsets: Vulkan bound texture zero. The corrected lookup binds actual textures. A frame-300 probe records 50 draws, valid texture descriptors, positive GPU samples, and nonzero render-target RGB values. The app loaded `main` and `sdk`, opened AudioRenderer at 48 kHz through AAudio, and presented with Turnip shader subgroup 64.
+- The A-area tap advances the wireless-headphone warning to the title and start menu. The lower-left origin fix keeps offscreen render targets bottom-up, reverses front-face winding for the positive-height viewport, and flips rows only in the display blit. On the Redmi K20 Pro Premium, the warning, title, menu heading, central labels, and side artwork are now upright. No texture-specific exception is used.
+- The earlier fragment-coordinate Y experiment alone did not fix the menu. Eight R8 glyph uploads matched their source rows. A targeted capture placed the inversion between the 1000×900 offscreen target and the screen target. See `.touchable/work/rhythm-heaven/reports/android-host-20261023.md` and `.touchable/build/games/rhythm-heaven/android/origin-correction-20261023/` for the device evidence. Timing calibration, rhythm gameplay, audible output, and save/load remain unverified. The media stream stays muted at the owner's request. Keep status `in-progress`. Do not distribute the embedded APK; it contains user-owned game code.
+
+### Standalone Android package and original artwork
+
+Build with `.touchable/venv/bin/python internal/tools/build_android.py --game rhythm-heaven --standalone`.
+The private APK includes both modules, all 7,237 active RomFS files, 108 shader-cache files, and Turnip.
+The launcher prepares its bundled data on the first start. It shows progress and enables Start only after import acceptance. Saves are not part of this import.
+The original Simplified Chinese Control-NCA icon and decoded title/menu graphics supply the local launcher artwork. `internal/tools/prepare_rhythm_artwork.py` prepares these assets. Extracted artwork stays outside Git.
+Android now uses the shared HID haptic mix for phone vibration. Background transitions clear it. Android amplitude control does not reproduce Core Haptics sharpness.
+The A touch area and single-button left area show the iOS-style touch glow and caption. Release fades the preview over 160 ms.
+Checks on 2026-10-23: standalone APK build and signing checks passed. A host JVM streamed the APK's six data chunks through `PackageArchive.unpack`. All extracted RomFS and shader hashes matched their sources. A native device smoke checked multi-touch holds, release fade and cancellation. A host smoke checked haptic mixing, stop and background suppression without replay.
+The Redmi K20 Pro Premium reconnected. The standalone APK installed successfully. With old developer RomFS/shaders renamed out of the runtime paths, first-start preparation reached completion and the game entered the warning, start menu and umbrella tutorial. No external data was pushed. The live A-area glow/caption and final uncropped launcher artwork were captured. Existing saves were preserved and backed up. Android's vibrator service recorded this app's guest-driven `USAGE_GAME` output at amplitude 0.502. It reported the actuator off after the app entered the background. Physical feel and rhythm latency are not measured.
+The final artwork-fit APK is `.touchable/build/games/rhythm-heaven/android/RhythmHeaven-android-20261023-191020-975223.apk` (2,754,404,627 bytes). SHA-256: `eab70316d2a48269e5abb98f33fb0e25fdd4eb07acae439667e0f2e5ff6bb5d2`. Evidence is in `.touchable/build/games/rhythm-heaven/android/ios-feedback-20261023/`.
+
 ## 2026-10-21: TV mode follows the audio output (build 38)
 
 The user asked to remove the mode button and to choose the mode from the audio output.

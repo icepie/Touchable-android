@@ -102,7 +102,9 @@ void touchable_game_install(void) {
     g_dm_fs_open_hook = rh_fs_open;
     rh_select_draw_size(main);
     rh_menu_install(main);
+#ifndef __ANDROID__
     rh_batch_install(main);
+#endif
     rh_start_input_file();
 }
 

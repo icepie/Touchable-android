@@ -10,8 +10,8 @@ Two output contracts share one capture source:
   $DM_VK_SHADERS. The key rule is the capture key (control plus code when the
   profile sets SS_SHADER_KEY_CODE); the akari key derivation is patched to match.
 
-A lower-left window origin is applied by the host with a negative-viewport transform,
-not by a shader flip, so no --flip-vert-y pass runs here.
+For lower-left NVN window origins, translated shaders also invert fragment-coordinate
+Y reads. The Vulkan host uses bottom-up render targets and flips only at presentation.
 """
 import argparse
 import hashlib
@@ -53,10 +53,10 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def tool_fingerprint(config, validator):
+def tool_fingerprint(config, validator, translator_source):
     names = [Path(__file__), Path(__file__).with_name('extract_shaders.py'),
              Path(__file__).with_name('shader_keys.py'), Path(__file__).with_name('build_shaders.py'),
-             XLATE / 'dmsh_xlate.dll', XLATE / 'Ryujinx.Graphics.Shader.dll']
+             XLATE / 'dmsh_xlate.dll', XLATE / 'Ryujinx.Graphics.Shader.dll', translator_source]
     fingerprint = {p.name: digest(p) for p in names}
     fingerprint['spirv-val'] = run([validator, '--version']).strip().splitlines()[0]
     fingerprint['target'] = 'vulkan1.1'
@@ -67,7 +67,7 @@ def tool_fingerprint(config, validator):
     return fingerprint
 
 
-def build_akari(args, jobs, out, work, validator):
+def build_akari(args, jobs, out, work, validator, y_negate):
     """Write akari-contract jobs and run the pinned translator driver.
 
     The driver at dm/android/tools/build_shaders.py builds its own patched
@@ -85,7 +85,7 @@ def build_akari(args, jobs, out, work, validator):
                      c1=job['c1'], tex=job['tex'], img=job['img'], attr=job['attr'],
                      fout=job['fout'], debug=False, reduced=False,
                      set=sets[job['stage']], host_subgroup_size=args.host_subgroup_size,
-                     shared=job.get('shared', 0))
+                     y_negate=y_negate, shared=job.get('shared', 0))
         if 'local' in job:
             entry['local'] = job['local']
         converted.append(entry)
@@ -142,7 +142,8 @@ def main():
     work = out / ('jobs-src' if args.contract == 'akari' else 'translate')
     work.mkdir(parents=True, exist_ok=True)
 
-    fingerprint = tool_fingerprint(config, validator)
+    translator_source = args.akari / 'dm/gfx/tools/dmsh_xlate/Program.cs' if args.contract == 'akari' else XLATE / 'dmsh_xlate.dll'
+    fingerprint = tool_fingerprint(config, validator, translator_source)
     origin = config.profile.get('nvn_window_origin', 'upper-left')
     if origin not in ('upper-left', 'lower-left'):
         raise GameError('profile.nvn_window_origin must be upper-left or lower-left.')
@@ -160,7 +161,7 @@ def main():
             job['attr'] = dict(attribute_types)
 
     if args.contract == 'akari':
-        build_akari(args, jobs, out, work, validator)
+        build_akari(args, jobs, out, work, validator, lower_left)
         return
     jobs_file = work / 'jobs.json'
     jobs_file.write_text(json.dumps(jobs, indent=2) + '\n')

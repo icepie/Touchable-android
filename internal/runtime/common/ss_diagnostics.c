@@ -2,8 +2,14 @@
 #include "touchable_game.h"
 #include <signal.h>
 #include <sys/ucontext.h>
+#ifdef __ANDROID__
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include "dm_ucontext.h"
+#else
 #include <mach/arm/thread_status.h>
 #include <mach/mach.h>
+#endif
 #include <unistd.h>
 #include <stdatomic.h>
 
@@ -23,7 +29,13 @@ void crash_set_wait_dump(void (*function)(void)) { wait_dump = function; }
 
 static pthread_key_t signal_stack_key;
 static pthread_once_t signal_stack_once = PTHREAD_ONCE_INIT;
-static void free_signal_stack(void *pointer) { free(pointer); }
+static void free_signal_stack(void *pointer) {
+#ifdef __ANDROID__
+    stack_t disabled = {.ss_flags = SS_DISABLE};
+    sigaltstack(&disabled, NULL);
+#endif
+    free(pointer);
+}
 static void create_signal_key(void) {
     if (pthread_key_create(&signal_stack_key, free_signal_stack)) die("Cannot create signal stack key");
 }
@@ -42,9 +54,16 @@ static void describe_address(const char *label, uintptr_t address) {
 }
 void dm_backtrace(uint64_t frame) {
     for (int i = 0; frame && !(frame & 15) && i < 32; ++i) {
-        uint64_t pair[2]; vm_size_t copied = 0;
+        uint64_t pair[2];
+#ifdef __ANDROID__
+        struct iovec local = {pair, sizeof(pair)};
+        struct iovec remote = {(void *)(uintptr_t)frame, sizeof(pair)};
+        if (syscall(SYS_process_vm_readv, getpid(), &local, 1, &remote, 1, 0) != sizeof(pair)) break;
+#else
+        vm_size_t copied = 0;
         if (vm_read_overwrite(mach_task_self(), frame, sizeof(pair), (vm_address_t)pair, &copied) ||
             copied != sizeof(pair)) break;
+#endif
         describe_address("frame", pair[1]);
         if (pair[0] <= frame || pair[0] - frame > 16 * 1024 * 1024) break;
         frame = pair[0];
@@ -55,12 +74,23 @@ static void crash(int number, siginfo_t *info, void *context) {
     ucontext_t *uc = context;
     int (*function)(void *, int, void *) = atomic_load(&fault_hook);
     if ((number == SIGSEGV || number == SIGBUS) && function &&
+#ifdef __ANDROID__
+        function(info->si_addr, dm_uc_is_write(uc), context)) return;
+#else
         function(info->si_addr, (uc->uc_mcontext->__es.__esr >> 6) & 1, context)) return;
+#endif
     LOG("CRASH signal=%d address=%p", number, info->si_addr);
+#ifdef __ANDROID__
+    describe_address("PC", DM_UC_PC(uc));
+    describe_address("LR", DM_UC_LR(uc));
+    for (int i = 0; i < 29; ++i) LOG("x%d=%#llx", i, (unsigned long long)DM_UC_REG(uc, i));
+    dm_backtrace(DM_UC_FP(uc));
+#else
     describe_address("PC", arm_thread_state64_get_pc(uc->uc_mcontext->__ss));
     describe_address("LR", arm_thread_state64_get_lr(uc->uc_mcontext->__ss));
     for (int i = 0; i < 29; ++i) LOG("x%d=%#llx", i, uc->uc_mcontext->__ss.__x[i]);
     dm_backtrace(arm_thread_state64_get_fp(uc->uc_mcontext->__ss));
+#endif
     _exit(128 + number);
 }
 void ss_crash_install(void) {

@@ -1,3 +1,1683 @@
+diff --git a/dm/android/java/org/d2r/android/port/D2RActivity.java b/dm/android/java/org/d2r/android/port/D2RActivity.java
+index 5d51549..fe4da29 100644
+--- a/dm/android/java/org/d2r/android/port/D2RActivity.java
++++ b/dm/android/java/org/d2r/android/port/D2RActivity.java
+@@ -12,6 +12,7 @@ import android.os.BatteryManager;
+ import android.os.Build;
+ import android.os.Bundle;
+ import android.os.VibrationEffect;
++import android.media.AudioAttributes;
+ import android.os.Vibrator;
+ import android.os.VibratorManager;
+ import android.text.Editable;
+@@ -55,10 +56,16 @@ public final class D2RActivity extends NativeActivity {
+     // The touch-controls drawing layer (TouchOverlay) lives in its own non-touchable, non-focusable window above the
+     // native game window; touches still land in the game window.
+     private TouchOverlay touchOverlay;
++    private RhythmOverlay rhythmOverlay;
++    private TouchableGame touchableGame;
+     private boolean overlayAttached;
+     private boolean activityResumed;
+     private boolean frameCallbackPosted;
+     private Vibrator vibrator;
++    private static final AudioAttributes GAME_VIBRATION_ATTRIBUTES =
++        new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_GAME).build();
++    private static final long[] PHONE_WAVE_TIMINGS = { 0, 1000 };
++    private final int[] phoneWaveAmplitudes = { 0, 0 };
+     private BroadcastReceiver batteryReceiver;
+     private volatile int batteryVoltageMv = -1;
+     private volatile int batteryLevel = -1;
+@@ -75,6 +82,10 @@ public final class D2RActivity extends NativeActivity {
+     private static native void touchCancel();
+     private static native String uiText(String key);
+     private static native String hudLine(int which);
++    private static native int rhythmTick();
++    private static native int rhythmDraw(float[] out);
++    private static native void rhythmMetrics(int width, int height, float density, float left, float top, float right, float bottom);
++    private static native void rhythmCancel();
+     private static native void setOverlayEnabled(boolean enabled);
+     private static native void setQualityPreset(int preset);
+     private static native void setMenuOpen(boolean open);
+@@ -187,12 +198,15 @@ public final class D2RActivity extends NativeActivity {
+         menuOverlayRow.setOnClickListener(v -> { overlayEnabled = !overlayEnabled; setOverlayEnabled(overlayEnabled); persistOverlay(); updateMenuLabels(); });
+         column.addView(menuOverlayRow);
+         menuControlsRow = menuRow();
+-        menuControlsRow.setOnClickListener(v -> { controlsEnabled = !controlsEnabled; updateTouchVisibility(); updateMenuLabels(); sendFold(); });
++        menuControlsRow.setOnClickListener(v -> { controlsEnabled = !controlsEnabled; updateTouchVisibility(); updateMenuLabels(); if (touchableGame == null) sendFold(); });
+         column.addView(menuControlsRow);
+-        menuQualityRow = menuRow();
+-        menuQualityRow.setOnClickListener(v -> { qualityPreset = (qualityPreset + 1) % QUALITY_KEYS.length; setQualityPreset(QUALITY_LEVELS[qualityPreset]); updateMenuLabels(); });
+-        column.addView(menuQualityRow);
++        if (touchableGame == null) {
++            menuQualityRow = menuRow();
++            menuQualityRow.setOnClickListener(v -> { qualityPreset = (qualityPreset + 1) % QUALITY_KEYS.length; setQualityPreset(QUALITY_LEVELS[qualityPreset]); updateMenuLabels(); });
++            column.addView(menuQualityRow);
++        }
+         GamepadSupport.addMenuRows(column, this::menuRow);   // 手柄面键布局 / 按键图标 / 震动 | controller face layout / button icons / rumble
++        if (touchableGame == null) {
+         // 存档导入 / 导出：走系统的文件选择器，导出到玩家选的位置（下载目录等），导入也是玩家选文件。
+         // Save import/export goes through the system file picker: export writes to wherever the player picks
+         // (Downloads and so on), import reads a file the player picks.
+@@ -204,6 +218,7 @@ public final class D2RActivity extends NativeActivity {
+         importRow.setText(text("dmAndroidSaveImport"));
+         importRow.setOnClickListener(v -> confirmImportSave());
+         column.addView(importRow);
++        }
+         TextView exitRow = menuRow();
+         exitRow.setTextColor(GOLD);
+         exitRow.setText(text("dmAndroidMenuExit"));
+@@ -226,7 +241,7 @@ public final class D2RActivity extends NativeActivity {
+         String on = text("dmAndroidMenuOn"), off = text("dmAndroidMenuOff");
+         menuOverlayRow.setText(text("dmAndroidMenuOverlay") + "：" + (overlayEnabled ? on : off));
+         menuControlsRow.setText(text("dmAndroidMenuControls") + "：" + (controlsEnabled ? on : off));
+-        menuQualityRow.setText(text("dmAndroidMenuQuality") + "：" + text(QUALITY_KEYS[qualityPreset]));
++        if (menuQualityRow != null) menuQualityRow.setText(text("dmAndroidMenuQuality") + "：" + text(QUALITY_KEYS[qualityPreset]));
+     }
+ 
+     // 「帧率显示」写回配置：重启后还记得（native 启动时读 DM_DEBUG_OVERLAY）。
+@@ -456,6 +471,7 @@ public final class D2RActivity extends NativeActivity {
+ 
+     @Override public void onCreate(Bundle state) {
+         super.onCreate(state);
++        touchableGame = TouchableGame.load(this);
+         // 标记与活动的「创建 / 销毁」这一对绑定，语义就是"这个进程里还住着一个游戏活动"。
+         // The flag is paired with activity creation/destruction: it means "a game activity still lives in this process".
+         hostRunning = true;
+@@ -504,7 +520,8 @@ public final class D2RActivity extends NativeActivity {
+             VibratorManager manager = (VibratorManager) getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
+             vibrator = manager == null ? null : manager.getDefaultVibrator();
+         } else vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+-        touchOverlay = new TouchOverlay(this, new TouchOverlay.Source() {
++        if (touchableGame != null) rhythmOverlay = new RhythmOverlay(this, D2RActivity::rhythmDraw);
++        else touchOverlay = new TouchOverlay(this, new TouchOverlay.Source() {
+             @Override public int draw(float[] out) { return touchDraw(out); }
+             @Override public String text(String key) { return uiText(key); }
+             @Override public String hudLine(int which) { return D2RActivity.hudLine(which); }
+@@ -516,7 +533,7 @@ public final class D2RActivity extends NativeActivity {
+         Log.i("D2RAndroid", "[fold] fold_layout " + (foldEnabled ? "auto" : "off") + (fold == null ? "（缺省）" : ""));
+         // 关掉（off）就整个不碰：不挂窗口扩展、不开铰链传感器、每帧不读版面，走原来的路。
+         // Off means untouched: no window-extensions listener, no hinge sensor, no per-frame layout read -- the previous path.
+-        if (foldEnabled) {
++        if (touchableGame == null && foldEnabled) {
+             foldWatcher = new FoldWatcher(this, (feature, left, top, right, bottom, angle) -> {
+                 foldFeature = feature; foldLeft = left; foldTop = top; foldRight = right; foldBottom = bottom; foldAngle = angle; sendFold(); });
+             foldWatcher.start();
+@@ -531,6 +548,7 @@ public final class D2RActivity extends NativeActivity {
+     private boolean debuggable() { return (getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0; }
+ 
+     private void updateTouchVisibility() {
++        if (rhythmOverlay != null) rhythmOverlay.setControlsShown(controlsEnabled);
+         if (touchOverlay == null) return;
+         // 菜单里的「屏幕控件」开关只管画不画控件；手柄 / 触屏模式由原生按实际输入切换（dm_gamepad.m 的规则，touch_front.c）。
+         // 绘制层本身一直挂着：一键重开的黑幕不归这个开关管（它吞触点，关了控件也得让玩家看见黑幕而不是盲点主菜单）。
+@@ -555,8 +573,12 @@ public final class D2RActivity extends NativeActivity {
+         @Override public void doFrame(long frameTimeNanos) {
+             frameCallbackPosted = false;
+             if (!activityResumed || isFinishing() || isDestroyed()) return;
+-            int result = touchTick();
+-            if (touchOverlay != null) {
++            if (rhythmOverlay != null) {
++                boolean visible = rhythmTick() != 0 && controlsEnabled;
++                rhythmOverlay.setVisibility(visible ? View.VISIBLE : View.INVISIBLE);
++                if (visible) rhythmOverlay.invalidate();
++            } else if (touchOverlay != null) {
++                int result = touchTick();
+                 // 摺叠机操控台：读这一帧发布的版面；有操控台时绘制层要可见（前端页也画底）。刚进桌面轻震一下。
+                 // Foldable control deck: read the layout published for this frame; with a deck the overlay must be visible
+                 // (the background is drawn on front-end pages too). A light tick on entering tabletop.
+@@ -587,9 +609,9 @@ public final class D2RActivity extends NativeActivity {
+                 // 刚变回可见那一帧也重画（隐藏期间的变化没画过，round 5 Argon M1）。| Also redraw on the frame it becomes visible
+                 // again (changes while hidden were never drawn, round 5 Argon M1).
+                 if (shown && ((result & 1) != 0 || changed || deckChanged)) touchOverlay.invalidate();
++                int haptic = (result >> 4) & 15;
++                if (haptic != 0) vibrate(haptic);
+             }
+-            int haptic = (result >> 4) & 15;
+-            if (haptic != 0) vibrate(haptic);
+             postFrameCallback();
+         }
+     };
+@@ -600,7 +622,7 @@ public final class D2RActivity extends NativeActivity {
+     }
+ 
+     private void attachOverlay() {
+-        if (overlayAttached || touchOverlay == null || isFinishing() || isDestroyed()) return;
++        if (overlayAttached || (touchOverlay == null && rhythmOverlay == null) || isFinishing() || isDestroyed()) return;
+         View decor = getWindow().getDecorView();
+         if (decor.getWindowToken() == null) { decor.post(this::attachOverlay); return; }
+         WindowManager.LayoutParams params = new WindowManager.LayoutParams(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+@@ -611,8 +633,8 @@ public final class D2RActivity extends NativeActivity {
+         params.token = decor.getWindowToken();
+         params.gravity = Gravity.TOP | Gravity.LEFT;
+         params.layoutInDisplayCutoutMode = cutoutMode();
+-        params.setTitle("D2R touch overlay");
+-        getWindowManager().addView(touchOverlay, params);
++        params.setTitle(rhythmOverlay != null ? "Touchable rhythm controls" : "D2R touch overlay");
++        getWindowManager().addView(rhythmOverlay != null ? rhythmOverlay : touchOverlay, params);
+         overlayAttached = true;
+         Log.i("D2RAndroid", "[touch] overlay window attached");
+     }
+@@ -673,8 +695,10 @@ public final class D2RActivity extends NativeActivity {
+         if (Build.VERSION.SDK_INT >= 30) { android.graphics.Rect bounds = getWindowManager().getCurrentWindowMetrics().getBounds(); width = bounds.width(); height = bounds.height(); }
+         Log.i("D2RAndroid", "[touch] insets window=" + width + "x" + height + " cutout=" + left + "," + top + "," + right + "," + bottom +
+             " corners L/R/B=" + cornerL + "/" + cornerR + "/" + cornerB + " density=" + density + " tablet=" + tablet);
+-        if (width > 0 && height > 0)
+-            touchMetrics(width, height, density, Math.max(left, cornerL), top, Math.max(right, cornerR), Math.max(bottom, cornerB), tablet);
++        if (width > 0 && height > 0) {
++            if (rhythmOverlay != null) rhythmMetrics(width, height, density, Math.max(left, cornerL), top, Math.max(right, cornerR), Math.max(bottom, cornerB));
++            else touchMetrics(width, height, density, Math.max(left, cornerL), top, Math.max(right, cornerR), Math.max(bottom, cornerB), tablet);
++        }
+     }
+ 
+     // 掉落震动（宿主 dm_drophaptic.c 的三档）：VibrationEffect 组合原语（重 THUD / 中 CLICK / 轻 TICK），
+@@ -695,6 +719,27 @@ public final class D2RActivity extends NativeActivity {
+             Log.w("D2RAndroid", "[touch] haptic tier " + tier + " failed", error);
+         }
+     }
++    // Guest rumble is a continuous mono mix, not a touch-feedback pulse.  Use
++    // the GAME usage so system touch-haptics settings do not suppress it.
++    // The repeating waveform is replaced only when the mixed output changes;
++    // zero cancels it, so suspension never replays a stale effect.
++    public void phoneHaptic(float intensity, float sharpness) {
++        if (vibrator == null || !vibrator.hasVibrator()) return;
++        if (!activityResumed || isFinishing() || isDestroyed() || !(intensity > 0.0001f)) {
++            vibrator.cancel();
++            return;
++        }
++        int amplitude = Math.round(255.0f * Math.min(1.0f, intensity));
++        if (amplitude < 1) amplitude = 1;
++        phoneWaveAmplitudes[0] = amplitude;
++        phoneWaveAmplitudes[1] = amplitude;
++        try {
++            vibrator.vibrate(VibrationEffect.createWaveform(PHONE_WAVE_TIMINGS, phoneWaveAmplitudes, 0), GAME_VIBRATION_ATTRIBUTES);
++        } catch (RuntimeException error) {
++            Log.w("D2RAndroid", "[game-haptics] phone vibration failed", error);
++        }
++    }
++
+ 
+     @Override protected void onResume() {
+         super.onResume();
+@@ -706,6 +751,7 @@ public final class D2RActivity extends NativeActivity {
+ 
+     @Override protected void onPause() {
+         activityResumed = false;
++        if (vibrator != null) vibrator.cancel();
+         if (foldWatcher != null) foldWatcher.pause();
+         super.onPause();
+     }
+@@ -717,7 +763,17 @@ public final class D2RActivity extends NativeActivity {
+         // On focus loss (notification shade, system dialogs) finger lifts no longer reach the game window: cancel every
+         // touch first so no skill or movement sticks. On regaining focus, re-enter fullscreen (the bars may have been
+         // revealed).
+-        if (!focus) touchCancel(); else enterFullscreen();
++        if (!focus) { if (vibrator != null) vibrator.cancel(); if (rhythmOverlay != null) rhythmCancel(); else touchCancel(); } else enterFullscreen();
++    }
++
++    public void showSaveFailure(boolean storageFull) {
++        runOnUiThread(() -> {
++            if (isFinishing() || isDestroyed()) return;
++            String message = storageFull
++                ? "Not enough storage. Progress was not saved. Free up space on this device."
++                : "Progress was not saved. Check the game log for the cause.";
++            new AlertDialog.Builder(this).setMessage(message).setPositiveButton(android.R.string.ok, null).show();
++        });
+     }
+ 
+     public void updateDebug(String text) {
+@@ -764,7 +820,7 @@ public final class D2RActivity extends NativeActivity {
+                 .setNegativeButton(android.R.string.cancel, (d, which) -> finishText(request, "", false))
+                 .create();
+             textDialog = dialog;
+-            touchCancel();
++            if (rhythmOverlay != null) rhythmCancel(); else touchCancel();
+             dialog.setOnCancelListener(d -> finishText(request, "", false));
+             dialog.setOnDismissListener(d -> finishText(request, "", false));
+             dialog.setOnShowListener(d -> {
+@@ -812,7 +868,7 @@ public final class D2RActivity extends NativeActivity {
+         GamepadSupport.detach();
+         if (frameCallbackPosted) { Choreographer.getInstance().removeFrameCallback(frameCallback); frameCallbackPosted = false; }
+         if (foldWatcher != null) { foldWatcher.stop(); foldWatcher = null; }
+-        if (overlayAttached) { getWindowManager().removeViewImmediate(touchOverlay); overlayAttached = false; }
++        if (overlayAttached) { getWindowManager().removeViewImmediate(rhythmOverlay != null ? rhythmOverlay : touchOverlay); overlayAttached = false; }
+         if (debugPopup != null) debugPopup.dismiss();
+         if (textDialog != null) finishText(textRequest, "", false);
+         super.onDestroy();
+diff --git a/dm/android/java/org/d2r/android/port/LauncherActivity.java b/dm/android/java/org/d2r/android/port/LauncherActivity.java
+index ce823b4..c0ab1b1 100644
+--- a/dm/android/java/org/d2r/android/port/LauncherActivity.java
++++ b/dm/android/java/org/d2r/android/port/LauncherActivity.java
+@@ -62,10 +62,10 @@ public final class LauncherActivity extends Activity {
+     private static final int IMPORT_SAVE = 3;
+     private static final int PICK_TOUCH = 4;
+ 
+-    private static final int GOLD = 0xffe8c078;
+-    private static final int PARCHMENT = 0xffe8e0d0;
+-    private static final int MUTED = 0xffa2988c;
+-    private static final int WARNING = 0xffd08a78;
++    private int GOLD = 0xffe8c078;
++    private int PARCHMENT = 0xffe8e0d0;
++    private int MUTED = 0xffa2988c;
++    private int WARNING = 0xffd08a78;
+ 
+     private Switch overlaySwitch;
+     private TextView profileItem, resolutionItem, driverItem, importItem, statusView, startItem;
+@@ -78,6 +78,9 @@ public final class LauncherActivity extends Activity {
+     // After Start the touch pack is verified on a background thread (all SHA-256, about 70-110 ms on a phone) and the start
+     // continues only then; Start is disabled meanwhile.
+     private boolean checking;
++    private TouchableGame touchableGame;
++    private StandalonePackage standalone;
++    private String standaloneError;
+     // 进行中的导入是哪一项开的（1 数据包、2 触屏包）：只有同一项再点一次才取消，相邻那一项不会误取消数 GB 的整包导入（round 3 Opus M5）。
+     // Which item started the running import (1 package, 2 touch pack): only that same item cancels it on a second tap, so the
+     // neighbouring item cannot cancel a multi-GB package import by accident (round 3 Opus M5).
+@@ -159,9 +162,18 @@ public final class LauncherActivity extends Activity {
+ 
+     private File packageManifest() { return new File(packageDirectory(), MANIFEST_NAME); }
+ 
+-    // 导入是否完成，以 manifest.json 为准（它在解包最后才写）。没导入就不该能启动游戏。
+-    // "Imported" means manifest.json exists, and it is written last. Without it the game must not start.
+-    private boolean packageReady() { return packageManifest().isFile(); }
++    // Imported packages have a completion marker. An embedded game can also use
++    // locally transferred RomFS and shader files with its APK's native modules.
++    private boolean packageReady() {
++        if (standaloneError != null) return false;
++        if (standalone != null) return standalone.ready();
++        if (packageManifest().isFile()) return true;
++        if (touchableGame == null) return false;
++        File external = getExternalFilesDir(null);
++        if (external == null || !new File(external, "romfs").isDirectory()
++                || !new File(external, "shaders/host-subgroup-size.txt").isFile()) return false;
++        return touchableGame.librariesPresent(new File(getApplicationInfo().nativeLibraryDir));
++    }
+ 
+     // 只做最简单的 key=value 读取；权威解析在 native 的 launch_settings.c。
+     // Minimal key=value read; the authoritative parser is launch_settings.c on the native side.
+@@ -257,7 +269,9 @@ public final class LauncherActivity extends Activity {
+     // driver actually selected and refuses to start on a mismatch, so subgroup_size has to be copied from here
+     // rather than guessed.
+     private String readProfileSize() {
+-        File profile = new File(packageDirectory(), "shaders/host-subgroup-size.txt");
++        File profile = touchableGame != null && !packageManifest().isFile()
++                ? new File(getExternalFilesDir(null), "shaders/host-subgroup-size.txt")
++                : new File(packageDirectory(), "shaders/host-subgroup-size.txt");
+         try (InputStream stream = new FileInputStream(profile)) {
+             byte[] text = new byte[16];
+             int count = stream.read(text);
+@@ -339,7 +353,7 @@ public final class LauncherActivity extends Activity {
+         if (profileItem != null) profileItem.setText(profileLabel());
+         if (resolutionItem != null) resolutionItem.setText(resolutionLabel());
+         if (driverItem != null) driverItem.setText(driverLabel());
+-        if (importItem != null) importItem.setText(importLabel());
++        if (importItem != null && standalone == null) importItem.setText(importLabel());
+         if (startItem != null) updateStartState();
+     }
+ 
+@@ -381,6 +395,13 @@ public final class LauncherActivity extends Activity {
+ 
+     @Override public void onCreate(Bundle state) {
+         super.onCreate(state);
++        touchableGame = TouchableGame.load(this);
++        if (touchableGame != null) {
++            GOLD=0xff675495;PARCHMENT=0xff393542;MUTED=0xff777080;WARNING=0xffa42d38;
++            try { standalone=StandalonePackage.load(this); }
++            catch (IOException error) { standaloneError=error.getMessage(); }
++        }
++        if (touchableGame != null) PackageArchive.configureTouchable(touchableGame.modules());
+         if (stepAsideForRunningGame()) return;
+         int width = getResources().getDisplayMetrics().widthPixels;
+         int height = getResources().getDisplayMetrics().heightPixels;
+@@ -395,8 +416,8 @@ public final class LauncherActivity extends Activity {
+         column.setGravity(Gravity.END);
+         column.setPadding(margin, (int)(height * 0.075f), margin, (int)(height * 0.045f));
+ 
+-        column.addView(item(text("dmAndroidLaunchTitle"), 42, GOLD, true, false));
+-        column.addView(item(text("dmAndroidLaunchSubtitle"), 15, MUTED, false, false));
++        column.addView(item(touchableGame != null ? "节奏天国" : text("dmAndroidLaunchTitle"), 42, GOLD, true, false));
++        column.addView(item(touchableGame != null ? "Touchable · Android" : text("dmAndroidLaunchSubtitle"), 15, MUTED, false, false));
+ 
+         column.addView(new View(this), new LinearLayout.LayoutParams(1, 0, 1.6f));
+ 
+@@ -425,15 +446,15 @@ public final class LauncherActivity extends Activity {
+             column.addView(driverItem);
+         }
+ 
+-        importItem = item(importLabel(), 19, PARCHMENT, false, true);
+-        importItem.setOnClickListener(v -> pickPackage());
++        importItem = item(standalone != null ? "准备游戏数据" : importLabel(), 19, PARCHMENT, false, true);
++        importItem.setOnClickListener(v -> { if (standalone != null) standalone.start(true); else pickPackage(); });
+         column.addView(importItem);
+-        // 只导入触屏包（make_touch_pack.py --zip，约 11 MB）：给已有安装补上 / 换掉触屏包，不必重导整个数据包。
+-        // Import only the touch pack (make_touch_pack.py --zip, about 11 MB): adds or replaces the touch pack of an
+-        // existing install without re-importing the whole package.
+-        TextView touchItem = item(text("dmAndroidLaunchImportTouch"), 19, PARCHMENT, false, true);
+-        touchItem.setOnClickListener(v -> pickTouchPack());
+-        column.addView(touchItem);
++        if (touchableGame == null) {
++            // A D2R installation needs the matching game-derived touch art.
++            TextView touchItem = item(text("dmAndroidLaunchImportTouch"), 19, PARCHMENT, false, true);
++            touchItem.setOnClickListener(v -> pickTouchPack());
++            column.addView(touchItem);
++        }
+ 
+         // 存档导入/导出：走系统的文件选择器（应用不需要任何存储权限），包是玩家自己选的路径。
+         // Save import/export goes through the system file picker (the app needs no storage permission); the player
+@@ -449,17 +470,40 @@ public final class LauncherActivity extends Activity {
+ 
+         statusView = item("", 14, WARNING, false, false);
+         column.addView(statusView);
+-        column.addView(item(text("dmAndroidLaunchPending"), 13, MUTED, false, false));
++        if (touchableGame == null) column.addView(item(text("dmAndroidLaunchPending"), 13, MUTED, false, false));
+ 
+         ScrollView scroll = new ScrollView(this);
+         scroll.setFillViewport(true);
+         scroll.addView(column, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                                                             ViewGroup.LayoutParams.MATCH_PARENT));
+-        root.addView(scroll, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+-                                                          ViewGroup.LayoutParams.MATCH_PARENT));
++        // The original title logo and mascots occupy the left 39%; leave them unobstructed.
++        FrameLayout.LayoutParams menuLayout = new FrameLayout.LayoutParams(
++            touchableGame != null ? (int)(width * 0.58f) : ViewGroup.LayoutParams.MATCH_PARENT,
++            ViewGroup.LayoutParams.MATCH_PARENT, Gravity.END);
++        root.addView(scroll, menuLayout);
+ 
+         refreshFromDisk();
+         setContentView(root);
++        if (standaloneError != null) setStatus(standaloneError,WARNING);
++        if (standalone != null) {
++            standalone.observe(new StandalonePackage.Observer() {
++                public void progress(int percent) { runOnUiThread(() -> {
++                    importing=true;updateStartState();
++                    importItem.setText("正在准备游戏数据 · " + percent + "%");
++                    setStatus("首次启动需解压内置资源，请保持应用打开。",MUTED);
++                }); }
++                public void finished(Exception error) { runOnUiThread(() -> {
++                    importing=false;updateStartState();
++                    importItem.setText(error == null ? "游戏数据已就绪" : "重新准备游戏数据");
++                    setStatus(error == null ? "" : failureText(error),WARNING);
++                }); }
++            });
++            standalone.start(false);
++        }
++    }
++    @Override protected void onDestroy() {
++        if (standalone != null) standalone.observe(null);
++        super.onDestroy();
+     }
+ 
+     @Override protected void onResume() {
+@@ -711,7 +755,7 @@ public final class LauncherActivity extends Activity {
+                     runOnUiThread(() -> setStatus(String.format(text("dmAndroidLaunchImporting"), percent), MUTED));
+                 }
+                 @Override public boolean cancelled() { return cancelImport; }
+-            }, LauncherActivity::declaration, LauncherActivity::checkHudLayout);
++            }, LauncherActivity::declaration, touchableGame == null ? LauncherActivity::checkHudLayout : TouchPack.NO_CONTENT_CHECK);
+         }
+         // 显示**实际解出**的数量。清单自报的数只参与校验、不当结果显示 —— 以前正是把它当结果显示，
+         // 才让一个只装了一个文件的包报出"46 个资源、20795 个着色器"。
+@@ -757,10 +801,11 @@ public final class LauncherActivity extends Activity {
+             setStatus(String.format(text("dmAndroidLaunchImporting"), 0), WARNING);
+             return;
+         }
+-        if (!packageManifest().isFile()) {
++        if (!packageReady()) {
+             setStatus(text("dmAndroidLaunchNeedsImport"), WARNING);
+             return;
+         }
++        if (touchableGame != null) { continueStart(); return; }
+         // 触屏包（make_touch_pack.py）整份核对通过才启动，不通过写明原因：游戏端（frontend_activity.c boot）也会拒绝，这里先拦。
+         // 核对放到背景线程（不卡 UI 线程），画面先显示「正在核对」；核完回到 UI 线程继续启动。
+         // Start only when the touch pack (make_touch_pack.py) verifies as a whole, otherwise say why: the game side
+diff --git a/dm/android/java/org/d2r/android/port/LauncherBackgroundView.java b/dm/android/java/org/d2r/android/port/LauncherBackgroundView.java
+index 7a08e50..8210a28 100644
+--- a/dm/android/java/org/d2r/android/port/LauncherBackgroundView.java
++++ b/dm/android/java/org/d2r/android/port/LauncherBackgroundView.java
+@@ -29,8 +29,9 @@ final class LauncherBackgroundView extends View {
+     private Bitmap prepared;      // 已经为当前屏幕尺寸处理好的那一张（缩过或原图）
+     private int preparedForWidth, preparedForHeight;
+     private boolean artworkChecked;
++    private final boolean light;
+ 
+-    LauncherBackgroundView(Context context) { super(context); }
++    LauncherBackgroundView(Context context) { super(context); light=TouchableGame.load(context)!=null; }
+ 
+     private void loadArtwork() {
+         artworkChecked = true;
+@@ -74,10 +75,11 @@ final class LauncherBackgroundView extends View {
+         if (width <= 0 || height <= 0) return;
+ 
+         Bitmap source = prepare(width, height);
++        if (light) canvas.drawColor(0xfffff8ed);
+         if (source != null) {
+             // 居中裁切铺满：不留黑边也不拉伸变形。
+             // Centre-crop to fill: no letterboxing and no stretching.
+-            float scale = Math.max((float) width / source.getWidth(), (float) height / source.getHeight());
++            float scale = light ? Math.min((float) width / source.getWidth(), (float) height / source.getHeight()) : Math.max((float) width / source.getWidth(), (float) height / source.getHeight());
+             float scaledWidth = source.getWidth() * scale, scaledHeight = source.getHeight() * scale;
+             paint.setShader(null);
+             paint.setAlpha(255);
+@@ -89,11 +91,12 @@ final class LauncherBackgroundView extends View {
+             // A light darkening overall, heavier along the right edge where every label sits, so the text stays
+             // legible on any artwork.
+             paint.setShader(new LinearGradient(width * 0.45f, 0, width, 0,
+-                new int[]{0x55000000, 0xcc000000}, new float[]{0f, 1f}, Shader.TileMode.CLAMP));
++                light ? new int[]{0x00fffcee, 0xeefffcee} : new int[]{0x55000000, 0xcc000000}, new float[]{0f, 1f}, Shader.TileMode.CLAMP));
+             canvas.drawRect(0, 0, width, height, paint);
+             paint.setShader(null);
+             return;
+         }
++        if (light) { canvas.drawColor(0xfffffcee); return; }
+ 
+         // 没有素材时的兜底：石壁底色 + 两团火光 + 暗角，全部按比例定位，任何分辨率一致。
+         // Fallback without artwork: stone base, two fires and a vignette, placed by ratio so any resolution matches.
+diff --git a/dm/android/java/org/d2r/android/port/PackageArchive.java b/dm/android/java/org/d2r/android/port/PackageArchive.java
+index cbc1e01..c353124 100644
+--- a/dm/android/java/org/d2r/android/port/PackageArchive.java
++++ b/dm/android/java/org/d2r/android/port/PackageArchive.java
+@@ -40,6 +40,13 @@ final class PackageArchive {
+     // change both sides together.
+     static final String[] MODULE_NAMES = {"main", "sdk", "subsdk0"};
+     static final String[] LAYOUT_KINDS = {"fixups", "gates"};
++    private static String[] activeModules = MODULE_NAMES;
++    private static boolean touchableRuntime;
++    static void configureTouchable(String[] modules) {
++        if (modules == null || modules.length == 0) throw new IllegalArgumentException("game modules required");
++        activeModules = modules.clone();
++        touchableRuntime = true;
++    }
+ 
+     // 上限只用来挡恶意或损坏的包：真实包约 9 GB、约 4.2 万个条目、清单 310 字节，离这些值很远。
+     // The caps only stop a hostile or corrupt archive: a real package is about 9 GB, about 42k entries and a
+@@ -124,7 +131,7 @@ final class PackageArchive {
+     // The nine required files: three modules, each with a fixups and a gates layout.
+     static List<String> requiredModules() {
+         List<String> names = new ArrayList<>();
+-        for (String module : MODULE_NAMES) {
++        for (String module : activeModules) {
+             names.add("libdmguest_" + module + ".so");
+             for (String kind : LAYOUT_KINDS) names.add(module + "." + kind + ".tsv");
+         }
+@@ -291,7 +298,7 @@ final class PackageArchive {
+             // 触屏包：核对暂存目录（对这次解出的 RomFS），通过才换。| Touch pack: verify the staging directory (against
+             // the RomFS just unpacked) and swap only if it passes.
+             File romfsManifest = new File(assets, ROMFS_MANIFEST);
+-            if (touch > 0) TouchPack.verify(touchStaging, romfsManifest, touchCheck);
++            if (touch > 0 && !touchableRuntime) TouchPack.verify(touchStaging, romfsManifest, touchCheck);
+             if (sink.cancelled()) throw new Failure("dmAndroidLaunchImportCancelled");
+ 
+             swap(staging, modules);
+@@ -300,7 +307,7 @@ final class PackageArchive {
+             // failure before that moves it back (round 2 Codex I1).
+             boolean staleRemoved = false;
+             if (touch > 0) previousTouch = swapKeep(touchStaging, installedTouch);
+-            else if (installedTouch.exists()) {
++            else if (installedTouch.exists() && !touchableRuntime) {
+                 try { TouchPack.verify(installedTouch, romfsManifest, touchCheck); }
+                 catch (Failure stale) { previousTouch = setAside(installedTouch); staleRemoved = true; }
+             }
+diff --git a/dm/android/java/org/d2r/android/port/RhythmOverlay.java b/dm/android/java/org/d2r/android/port/RhythmOverlay.java
+new file mode 100644
+index 0000000..c974d3c
+--- /dev/null
++++ b/dm/android/java/org/d2r/android/port/RhythmOverlay.java
+@@ -0,0 +1,83 @@
++package org.d2r.android.port;
++
++import android.content.Context;
++import android.graphics.Canvas;
++import android.graphics.Color;
++import android.graphics.Paint;
++import android.graphics.RectF;
++import android.graphics.RadialGradient;
++import android.graphics.Shader;
++import android.view.View;
++
++/* The window is deliberately not touchable. NativeActivity's input queue owns every finger;
++   this reads the same geometry/hints as the hit tester in ss_android_touch.c. */
++final class RhythmOverlay extends View {
++    interface Source { int draw(float[] out); }
++    private final Source source;
++    private final float[] snapshot = new float[10 + 9 * 6 + 16 * 4];
++    private final RadialGradient feedback = new RadialGradient(0, 0, 80,
++        new int[]{0x3dffffff, 0x1affffff, 0x00ffffff}, new float[]{0, .42f, 1}, Shader.TileMode.CLAMP);
++    private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
++    private final RectF rect = new RectF();
++    private boolean controlsShown = true;
++
++    RhythmOverlay(Context context, Source source) { super(context); this.source = source; setLayerType(View.LAYER_TYPE_SOFTWARE, null); }
++    void setControlsShown(boolean shown) { if (controlsShown != shown) { controlsShown = shown; invalidate(); } }
++    private static String symbol(int bit) {
++        switch(bit) {
++            case 0: return "A"; case 1: return "B"; case 2: return "X"; case 3: return "Y";
++            case 10: return "+"; case 11: return "−";
++            case 12: return "◀"; case 13: return "▲"; case 14: return "▶"; case 15: return "▼";
++            default: return "•";
++        }
++    }
++    private void label(Canvas canvas, String text, float x, float y, float size, int alpha) {
++        paint.setStyle(Paint.Style.FILL);paint.setColor(Color.WHITE);paint.setAlpha(alpha);
++        paint.setTextAlign(Paint.Align.CENTER);paint.setTextSize(size);paint.setFakeBoldText(true);
++        canvas.drawText(text, x, y - (paint.ascent() + paint.descent()) / 2, paint);
++    }
++    @Override protected void onDraw(Canvas canvas) {
++        if (!controlsShown || source.draw(snapshot) != snapshot.length || snapshot[0] <= 0 || snapshot[1] <= 0) return;
++        float sx = getWidth() / snapshot[0], sy = getHeight() / snapshot[1];
++        canvas.save();canvas.scale(sx, sy);
++        float d = getResources().getDisplayMetrics().density;
++        float left = snapshot[2], right = snapshot[3], top = snapshot[4], bottom = snapshot[5];
++        if (left > 0 && right > left && bottom > top) {
++            rect.set(left, top, right, bottom);
++            paint.setStyle(Paint.Style.STROKE);paint.setStrokeWidth(d);paint.setColor(0x1affffff);
++            canvas.drawRoundRect(rect,18*d,18*d,paint);
++            paint.setColor(0x1affffff);canvas.drawLine((left+right)/2,top+16*d,(left+right)/2,bottom-16*d,paint);
++            label(canvas,symbol((int)snapshot[7]),(3*left+right)/4,(top+bottom)/2,36*d,71);
++            label(canvas,symbol((int)snapshot[8]),(left+3*right)/4,(top+bottom)/2,36*d,71);
++        }
++        for (int i = 9; i < 63; i += 6) {
++            int appearance=(int)snapshot[i+4];
++            if (appearance == 0 || appearance == 3) continue;
++            int bit=(int)snapshot[i];float x=snapshot[i+1],y=snapshot[i+2],r=snapshot[i+3]/2;
++            rect.set(x-r,y-r,x+r,y+r);
++            if (appearance == 1) {
++                paint.setStyle(Paint.Style.FILL);paint.setColor(snapshot[i+5]!=0?0x7095bfff:0x500d1827);
++                canvas.drawRoundRect(rect,r,r,paint);
++            }
++            paint.setStyle(Paint.Style.STROKE);paint.setStrokeWidth(d);paint.setColor(appearance==2?0x40ffffff:0xa8ffffff);
++            canvas.drawRoundRect(rect,r,r,paint);
++            label(canvas,symbol(bit),x,y,Math.min(23*d,r),appearance==2?64:230);
++        }
++        for (int i = 64; i < snapshot.length; i += 4) {
++            float alpha=snapshot[i+3];
++            if (alpha <= 0) continue;
++            float x=snapshot[i+1], y=snapshot[i+2];
++            canvas.save();canvas.translate(x,y);canvas.scale(d,d);
++            paint.setStyle(Paint.Style.FILL);paint.setColor(Color.WHITE);
++            paint.setAlpha(Math.round(255*alpha));paint.setShader(feedback);
++            canvas.drawCircle(0,0,80,paint);
++            paint.setShader(null);canvas.restore();
++            float captionX=Math.max(20*d,Math.min(x,snapshot[0]-20*d));
++            float captionY=Math.max(y-60*d,snapshot[63]+20*d);
++            paint.setShadowLayer(d,0,d,0x99000000);
++            label(canvas,symbol((int)snapshot[i]),captionX,captionY,26*d,Math.round(230*alpha));
++            paint.clearShadowLayer();
++        }
++        canvas.restore();
++    }
++}
+diff --git a/dm/android/java/org/d2r/android/port/StandalonePackage.java b/dm/android/java/org/d2r/android/port/StandalonePackage.java
+new file mode 100644
+index 0000000..22737aa
+--- /dev/null
++++ b/dm/android/java/org/d2r/android/port/StandalonePackage.java
+@@ -0,0 +1,180 @@
++package org.d2r.android.port;
++
++import android.content.Context;
++import android.content.res.AssetManager;
++
++import org.json.JSONArray;
++import org.json.JSONException;
++import org.json.JSONObject;
++
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.SequenceInputStream;
++import java.nio.charset.StandardCharsets;
++import java.util.Enumeration;
++import java.util.NoSuchElementException;
++
++/** Automatic installation of the private, locally built standalone payload.
++ * Only d2r-package is written: files/save, external saves and developer data are never touched.
++ * Streams use bounded buffers and long sizes, including payloads larger than 2 GiB.
++ */
++final class StandalonePackage {
++    interface Observer {
++        void progress(int percent);
++        void finished(Exception error);
++    }
++
++    private static StandalonePackage instance;
++    private final Context context;
++    private final JSONObject descriptor;
++    private final File assets, modules, marker;
++    private final String id;
++    private Observer observer;
++    private boolean running, attempted;
++    private int percent;
++    private Exception failure;
++
++    private StandalonePackage(Context application, JSONObject value) throws IOException, JSONException {
++        context = application;
++        descriptor = value;
++        if (value.getInt("format") != 1) throw new IOException("Unsupported standalone payload format");
++        id = value.getString("id");
++        if (!id.matches("[0-9a-f]{64}")) throw new IOException("Invalid standalone payload identity");
++        File external = application.getExternalFilesDir(null);
++        if (external == null) throw new IOException("Private external storage is unavailable; reopen the app when storage is mounted");
++        assets = new File(external, "d2r-package");
++        modules = new File(application.getFilesDir(), "d2r-package/game");
++        marker = new File(assets, "standalone-ready.sha256");
++        JSONArray parts = value.getJSONArray("parts");
++        if (parts.length() == 0) throw new IOException("Standalone payload has no parts");
++        for (int i = 0; i < parts.length(); i++)
++            if (!parts.getString(i).matches("standalone/payload-[0-9]{3}\\.bin"))
++                throw new IOException("Invalid standalone payload part");
++    }
++
++    static synchronized StandalonePackage load(Context context) throws IOException {
++        if (instance != null) return instance;
++        boolean present = false;
++        for (String name : context.getAssets().list("")) if (name.equals("standalone.json")) present = true;
++        if (!present) return null;
++        try (InputStream stream = context.getAssets().open("standalone.json")) {
++            JSONObject descriptor = new JSONObject(new String(readSmall(stream), StandardCharsets.UTF_8));
++            instance = new StandalonePackage(context.getApplicationContext(), descriptor);
++            return instance;
++        } catch (JSONException error) {
++            throw new IOException("Invalid standalone metadata: " + error.getMessage(), error);
++        }
++    }
++
++    synchronized boolean ready() {
++        if (running || !new File(assets, PackageArchive.MANIFEST).isFile()
++                || !new File(assets, "romfs").isDirectory()
++                || !new File(assets, "shaders/host-subgroup-size.txt").isFile()) return false;
++        for (String name : PackageArchive.requiredModules()) if (!new File(modules, name).isFile()) return false;
++        try (InputStream stream = new FileInputStream(marker)) {
++            return id.equals(new String(readSmall(stream), StandardCharsets.UTF_8).trim());
++        } catch (IOException error) { return false; }
++    }
++
++    synchronized void observe(Observer value) {
++        observer = value;
++        if (value == null) return;
++        if (running) value.progress(percent);
++        else if (attempted || ready()) value.finished(failure);
++    }
++
++    synchronized void start(boolean retry) {
++        if (running || ready() || (attempted && !retry)) return;
++        running = true;
++        attempted = true;
++        failure = null;
++        percent = 0;
++        publishProgress(0);
++        new Thread(this::prepare, "touchable-standalone-prepare").start();
++    }
++
++    private synchronized void publishProgress(int value) {
++        percent = Math.min(99, value);
++        if (observer != null) observer.progress(percent);
++    }
++
++    private void prepare() {
++        Exception problem = null;
++        try {
++            long externalBytes = descriptor.getLong("external_bytes");
++            long internalBytes = descriptor.getLong("internal_bytes");
++            long totalBytes = descriptor.getLong("unpacked_bytes");
++            if (externalBytes < 0 || internalBytes < 0 || totalBytes != externalBytes + internalBytes)
++                throw new IOException("Invalid standalone payload sizes");
++            requireSpace(assets.getParentFile(), externalBytes + (64L << 20), "game data");
++            requireSpace(context.getFilesDir(), internalBytes + (64L << 20), "game modules and driver");
++            if (!assets.isDirectory() && !assets.mkdirs()) throw new IOException("Cannot create game data directory");
++            if (marker.exists() && !marker.delete()) throw new IOException("Cannot clear standalone completion marker");
++            final JSONArray parts = descriptor.getJSONArray("parts");
++            // SequenceInputStream opens only the next bounded asset; never one multi-GB Java array.
++            Enumeration<InputStream> streams = new Enumeration<InputStream>() {
++                private int index;
++                @Override public boolean hasMoreElements() { return index < parts.length(); }
++                @Override public InputStream nextElement() {
++                    if (!hasMoreElements()) throw new NoSuchElementException();
++                    try { return context.getAssets().open(parts.getString(index++), AssetManager.ACCESS_STREAMING); }
++                    catch (IOException | JSONException error) { throw new PayloadReadFailure(error); }
++                }
++            };
++            try (InputStream raw = new SequenceInputStream(streams)) {
++                PackageArchive.unpack(raw, assets, modules, totalBytes, new PackageArchive.Sink() {
++                    @Override public void progress(int value) { publishProgress(value); }
++                    @Override public boolean cancelled() { return false; }
++                }, StandalonePackage::declaration, TouchPack.NO_CONTENT_CHECK);
++            }
++            // PackageArchive validates ZIP CRCs, required modules and all declared file counts,
++            // and writes manifest.json last. This build identity is committed only afterward.
++            File temporary = new File(assets, marker.getName() + ".tmp");
++            try (FileOutputStream out = new FileOutputStream(temporary)) {
++                out.write((id + "\n").getBytes(StandardCharsets.UTF_8));
++                out.getFD().sync();
++            }
++            if (!temporary.renameTo(marker)) throw new IOException("Cannot commit standalone completion marker");
++        } catch (Exception error) { problem = error; }
++        synchronized (this) {
++            running = false;
++            failure = problem;
++            if (observer != null) observer.finished(problem);
++        }
++    }
++
++    private static void requireSpace(File directory, long needed, String label) throws IOException {
++        if (directory.getUsableSpace() < needed)
++            throw new IOException(String.format(java.util.Locale.US,
++                    "Not enough storage for %s: %.2f GiB free required. Free space and tap Prepare again.",
++                    label, needed / (double)(1L << 30)));
++    }
++
++    private static byte[] readSmall(InputStream stream) throws IOException {
++        ByteArrayOutputStream out = new ByteArrayOutputStream();
++        byte[] buffer = new byte[4096];
++        int count;
++        while ((count = stream.read(buffer)) != -1) {
++            if (out.size() + count > 65536) throw new IOException("Standalone metadata is too large");
++            out.write(buffer, 0, count);
++        }
++        return out.toByteArray();
++    }
++
++    private static PackageArchive.Declaration declaration(byte[] bytes) throws IOException {
++        try {
++            JSONObject value = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
++            JSONObject counts = value.getJSONObject("counts");
++            return new PackageArchive.Declaration(value.getInt("format"), counts.getInt("game"),
++                    counts.getInt("romfs"), counts.getInt("shaders"), counts.getInt("touch"));
++        } catch (JSONException error) { throw new IOException("Invalid standalone manifest", error); }
++    }
++
++    private static final class PayloadReadFailure extends RuntimeException {
++        PayloadReadFailure(Exception cause) { super("Cannot read bundled game data: " + cause.getMessage(), cause); }
++    }
++}
+diff --git a/dm/android/java/org/d2r/android/port/TouchableGame.java b/dm/android/java/org/d2r/android/port/TouchableGame.java
+new file mode 100644
+index 0000000..e537f30
+--- /dev/null
++++ b/dm/android/java/org/d2r/android/port/TouchableGame.java
+@@ -0,0 +1,46 @@
++package org.d2r.android.port;
++
++import android.content.Context;
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.charset.StandardCharsets;
++import org.json.JSONArray;
++import org.json.JSONException;
++import org.json.JSONObject;
++
++/* Present only in Touchable APKs. Default Akari APKs keep their original launcher contract. */
++final class TouchableGame {
++    private static final String ASSET = "touchable_game.json";
++    private final String[] modules;
++    private TouchableGame(String[] modules) { this.modules = modules; }
++    String[] modules() { return modules.clone(); }
++    boolean librariesPresent(File nativeDir) {
++        for (String module : modules)
++            if (!new File(nativeDir, "libdmguest_" + module + ".so").isFile()) return false;
++        return true;
++    }
++
++    static TouchableGame load(Context context) {
++        try (InputStream stream = context.getAssets().open(ASSET)) {
++            byte[] data = new byte[stream.available()];
++            int off = 0, n;
++            while (off < data.length && (n = stream.read(data, off, data.length - off)) > 0) off += n;
++            JSONObject root = new JSONObject(new String(data, 0, off, StandardCharsets.UTF_8));
++            JSONArray names = root.getJSONArray("module_names");
++            if (names.length() == 0) throw new IllegalStateException("Touchable game has no modules");
++            String[] modules = new String[names.length()];
++            for (int i = 0; i < modules.length; i++) {
++                String name = names.getString(i);
++                if (!name.matches("[A-Za-z0-9_-]+")) throw new IllegalStateException("Invalid game module: " + name);
++                modules[i] = name;
++            }
++            return new TouchableGame(modules);
++        } catch (IOException missing) {
++            /* Akari's own APK has no game metadata asset. */
++            return null;
++        } catch (JSONException bad) {
++            throw new IllegalStateException("Invalid " + ASSET, bad);
++        }
++    }
++}
+diff --git a/dm/android/native/controller.c b/dm/android/native/controller.c
+index afed75c..9ddf7dc 100644
+--- a/dm/android/native/controller.c
++++ b/dm/android/native/controller.c
+@@ -6,6 +6,7 @@
+ #include "controller.h"
+ #include "../../host/dm.h"
+ #include "../../host/dm_gamepad_core.h"
++#include "ss_haptics.h"
+ #include <jni.h>
+ #include <pthread.h>
+ #include <stdatomic.h>
+@@ -15,6 +16,8 @@
+ #include <unistd.h>
+ 
+ void dm_padmode_glyphs(int set);   // 宿主 dm_padmode.c：键位图标套 | host dm_padmode.c: glyph set
++void dm_android_haptics_read(ss_haptic_output *out, uint64_t *sequence);
++void dm_android_haptics_wait(uint64_t sequence, unsigned milliseconds);
+ 
+ enum { NDEV = DM_PADSET_MAX, NTOMB = 32, FLAG_LT_CENTRED = 1, FLAG_RT_CENTRED = 2 };
+ // 每个手柄：Java 报来的设备信息（厂商 / 产品 / 名字、右摇杆与扳机用哪两根轴、死区、马达数），和事件里读到的当前状态。
+@@ -25,7 +28,7 @@ typedef struct {
+     unsigned vendor, product, face; float dead_l, dead_r; uint64_t keys, hat, trig, seen; int32_t ax[4]; char name[64];
+ } ctrl_dev;
+ static struct {
+-    ANativeActivity *activity; JavaVM *vm; jclass cls; jmethodID on_pad_mode, rumble, back;
++    ANativeActivity *activity; JavaVM *vm; jclass cls; jmethodID on_pad_mode, rumble, phone_haptic, back;
+     void (*republish)(void);
+     ctrl_dev dev[NDEV]; dm_padset set; uint64_t seen_clock;
+     int tomb[NTOMB], tomb_n;
+@@ -66,7 +69,11 @@ static void publish_state(void) {
+         if (env && C.cls && C.on_pad_mode) { (*env)->CallStaticVoidMethod(env, C.cls, C.on_pad_mode, (jboolean)(pad != 0)); jni_clear(env, "onPadMode"); } }
+     ctrl_dev *p = NULL; for (int i = 0; i < NDEV; i++) { ctrl_dev *d = &C.dev[i]; if (!d->seen || !d->known) continue; if (d->id == C.set.active) { p = d; break; } if (!p || d->seen > p->seen) p = d; }
+     int g = p ? dm_pad_glyphs(C.cfg_glyphs, p->family, dev_layout(p)) : DM_GLYPH_SWITCH;
+-    if (g != C.glyph_sent) { C.glyph_sent = g; dm_padmode_glyphs(g); LOG("手柄：键位图标套 → %s（%s）", dm_glyph_dir(g), p ? p->name : "没有手柄"); }
++    if (g != C.glyph_sent) { C.glyph_sent = g;
++#ifndef TOUCHABLE_SWITCH_RUNTIME
++        dm_padmode_glyphs(g);
++#endif
++        LOG("手柄：键位图标套 → %s（%s）", dm_glyph_dir(g), p ? p->name : "没有手柄"); }
+     ctrl_dev *a = C.set.active >= 0 ? dev_get(C.set.active, 0) : NULL;
+     atomic_store(&C.rumble_vibs, a ? a->vibrators : 0); atomic_store(&C.rumble_dev, pad && a ? a->id : -1);
+     if (C.set.active != C.logged_active) { C.logged_active = C.set.active;
+@@ -247,7 +254,7 @@ static int test_pump(uint64_t now) {
+ static void *rumble_main(void *arg) {
+     (void)arg; JNIEnv *env = NULL; if ((*C.vm)->AttachCurrentThread(C.vm, &env, NULL) != JNI_OK || !env) { LOG("【红】手柄震动：线程挂不上 JVM，不震动"); return NULL; }
+     prctl(PR_SET_NAME, "D2R rumble");
+-    dm_rumble_state st = { .last_dev = -1 }; uint64_t sends = 0, stalls = 0; int was_stalled = 0;
++    dm_rumble_state st = { .last_dev = -1 }; uint64_t sends = 0, stalls = 0, phone_sent = 0; int was_stalled = 0;
+     while (!atomic_load(&C.stop)) {
+         uint64_t now = mono_ms();
+         int dev = atomic_load(&C.suspended) ? -1 : atomic_load(&C.rumble_dev), vibs = atomic_load(&C.rumble_vibs), strength = atomic_load(&C.cfg_rumble);
+@@ -272,9 +279,20 @@ static void *rumble_main(void *arg) {
+                 LOG("[rumble] %s #%llu", stalled ? "游戏超过 300 ms 未送值 → 停震 (game stopped sending for 300 ms -> stop)" : "游戏恢复送值 (game sending again)", (unsigned long long)stalls);
+         }
+         int target = dev >= 0 && !stalled && would;
+-        usleep(dev >= 0 && vibs > 0 && (st.ls || st.lw || st.ps || st.pw || target) ? 16000 : 50000);
++        ss_haptic_output phone; uint64_t phone_sequence;
++        dm_android_haptics_read(&phone, &phone_sequence);
++        if (phone_sequence != phone_sent) {
++            if (C.phone_haptic) {
++                (*env)->CallVoidMethod(env, C.activity->clazz, C.phone_haptic, (jfloat)phone.intensity, (jfloat)phone.sharpness);
++                jni_clear(env, "phoneHaptic");
++            }
++            phone_sent = phone_sequence;
++        }
++        unsigned wait_ms = dev >= 0 && vibs > 0 && (st.ls || st.lw || st.ps || st.pw || target) ? 16 : 50;
++        dm_android_haptics_wait(phone_sequence, wait_ms);
+     }
+     if (st.last_dev >= 0 && (st.ls || st.lw)) { (*env)->CallStaticVoidMethod(env, C.cls, C.rumble, st.last_dev, 0, 0, 0); jni_clear(env, "rumble"); }
++    if (C.phone_haptic) { (*env)->CallVoidMethod(env, C.activity->clazz, C.phone_haptic, (jfloat)0, (jfloat)0); jni_clear(env, "phoneHaptic"); }
+     (*C.vm)->DetachCurrentThread(C.vm); return NULL;
+ }
+ 
+@@ -283,7 +301,7 @@ int dm_ctrl_init(ANativeActivity *a, void (*republish_fn)(void)) {
+     C.info_ok = 0; C.notified_mode = 0; C.glyph_sent = 0; C.logged_active = -1; C.thread_started = 0;
+     atomic_store(&C.rumble_dev, -1); atomic_store(&C.rumble_vibs, 0);
+     atomic_store(&C.suspended, 0); atomic_store(&C.stop, 0);
+-    C.republish = republish_fn; C.activity = a; C.vm = a->vm; C.cls = NULL; C.on_pad_mode = C.rumble = C.back = NULL;
++    C.republish = republish_fn; C.activity = a; C.vm = a->vm; C.cls = NULL; C.on_pad_mode = C.rumble = C.phone_haptic = C.back = NULL;
+     JNIEnv *env = a->env;
+     // NativeActivity 的主线程 FindClass 走的是框架类加载器，找不到 App 自己的类：从 Activity 的类加载器取 GamepadSupport。
+     // FindClass on the NativeActivity main thread uses the framework class loader and cannot see the App's own classes: load
+@@ -301,6 +319,7 @@ int dm_ctrl_init(ANativeActivity *a, void (*republish_fn)(void)) {
+     if ((*env)->RegisterNatives(env, C.cls, m, sizeof m / sizeof *m) != JNI_OK) { jni_clear(env, "RegisterNatives"); LOG("【红】手柄：GamepadSupport native 方法登记失败"); return -1; }
+     C.info_ok = 1;
+     C.on_pad_mode = (*env)->GetStaticMethodID(env, C.cls, "onPadMode", "(Z)V"); C.rumble = (*env)->GetStaticMethodID(env, C.cls, "rumble", "(IIII)V");
++    C.phone_haptic = (*env)->GetMethodID(env, act, "phoneHaptic", "(FF)V");
+     C.back = (*env)->GetMethodID(env, act, "onBackPressed", "()V"); jni_clear(env, "GetMethodID");
+     if (!C.on_pad_mode || !C.rumble) { LOG("【红】手柄：GamepadSupport 缺 onPadMode / rumble"); return -1; }
+     if (a->externalDataPath) snprintf(g_test_path, sizeof g_test_path, "%s/rumble_test", a->externalDataPath);
+diff --git a/dm/android/native/frontend_activity.c b/dm/android/native/frontend_activity.c
+index 4b0fb87..adf6e83 100644
+--- a/dm/android/native/frontend_activity.c
++++ b/dm/android/native/frontend_activity.c
+@@ -5,17 +5,28 @@
+ #include "../../host/hle.h"
+ #include "../../host/front.h"
+ #include "../../host/dm_input.h"
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+ #include "../../host/dm_actions.h"
+ #include "../../host/dm_i18n.h"
+ #include "../../host/dm_hud.h"
++#endif
+ #include "debug_stats.h"
+ #include "performance_hint.h"
+ #include "launch_settings.h"
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++#include "touchable_game_config.h"
++#include "ss_android_touch.h"
++#include "ss_display.h"
++#else
+ #include "touch_front.h"
++#endif
+ #include "controller.h"
++#include "ss_haptics.h"
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+ #include "posture.h"
+ #include "../../host/dm_uiscreen.h"
+ #include "../../gfx/nvn/nvn_dirty.h"
++#endif
+ #include <android/native_activity.h>
+ #include <android/native_window.h>
+ #include <android/window.h>
+@@ -41,6 +52,7 @@ typedef struct {
+     float requested_frame_rate;int frame_rate_attempted;
+ } game_app;
+ static game_app *application;
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+ // 姿态与出图尺寸的状态（见 front_game_res 前的说明）。| Posture / output size state (see the note before front_game_res).
+ static struct {
+     pthread_mutex_t lock;
+@@ -54,11 +66,15 @@ static void posture_init(game_app *s);
+ static void posture_window(ANativeWindow *window, const char *why);
+ static void posture_reconcile(const char *why);
+ static void *posture_thread(void *argument);
++#endif
+ static _Atomic int display_hz;
+ // 运行时可切的调试浮层（游戏内菜单的「帧率显示」）：UI 线程写，调试线程每拍读。启动初值见 debug_overlay 的读取处。
+ // Runtime-togglable debug overlay (the in-game menu's "frame rate display"): the UI thread writes it, the debug
+ // thread reads it every tick. The startup value is read where DM_DEBUG_OVERLAY is.
+ static _Atomic int debug_overlay_enabled;
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++static _Atomic int save_failure;
++#endif
+ // 游戏内菜单是否开着（见 input_ready）：开着就吞掉手柄与按键事件，免得角色在菜单后面继续动。
+ // Is the in-game menu open (see input_ready): while it is, pad and key events are swallowed so the character does
+ // not keep moving behind the menu.
+@@ -161,8 +177,21 @@ static void *progress_watch(void *argument) {
+     if(overlay_method)(*env)->CallVoidMethod(env,a->clazz,overlay_method,(jboolean)(overlay!=0));
+     else LOG("[android] debug overlay switch unavailable; showing the overlay");
+     int overlay_applied=overlay;
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++    jmethodID save_method=(*env)->GetMethodID(env,klass,"showSaveFailure","(Z)V");
++    if((*env)->ExceptionCheck(env)){(*env)->ExceptionDescribe(env);(*env)->ExceptionClear(env);save_method=NULL;}
++#endif
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+     uint64_t previous=0;unsigned unchanged=0;
+-    for(unsigned i=0;!atomic_load(&s->debug_stop);i++){usleep(500000);dm_android_debug_stats stats;dm_android_debug_get(&stats);dm_hud_info hud;dm_hud_get(&hud);
++#endif
++    for(unsigned i=0;!atomic_load(&s->debug_stop);i++){usleep(500000);dm_android_debug_stats stats;dm_android_debug_get(&stats);
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++        int failure=atomic_exchange(&save_failure,0);
++        if(failure && save_method)(*env)->CallVoidMethod(env,a->clazz,save_method,failure==1?JNI_TRUE:JNI_FALSE);
++        if((*env)->ExceptionCheck(env)){(*env)->ExceptionDescribe(env);(*env)->ExceptionClear(env);}
++#endif
++#ifndef TOUCHABLE_SWITCH_RUNTIME
++        dm_hud_info hud;dm_hud_get(&hud);
+         // 菜单改了浮层开关就跟着变：显示/隐藏交给 Java 侧，这里只决定还要不要产出文字。
+         // Follow the menu's overlay switch: the Java side owns show/hide, this loop only decides whether to produce text.
+         if((overlay=atomic_load(&debug_overlay_enabled))!=overlay_applied){overlay_applied=overlay;if(overlay_method)(*env)->CallVoidMethod(env,a->clazz,overlay_method,(jboolean)(overlay!=0));}
+@@ -237,6 +266,12 @@ static void *progress_watch(void *argument) {
+             errno=saved_errno;}
+         if(i<96&&i%4==0){uint64_t frame=dm_nvn_frame_count();LOG("[android] game progress frame=%llu input_samples=%llu",(unsigned long long)frame,(unsigned long long)dm_input_samples());
+             if(frame&&frame==previous&&!keyboard){if(++unchanged==4)crash_dump_now("Android first-frame progress stalled");}else unchanged=0;previous=frame;}
++#else
++        if((overlay=atomic_load(&debug_overlay_enabled))!=overlay_applied){overlay_applied=overlay;if(overlay_method)(*env)->CallVoidMethod(env,a->clazz,overlay_method,(jboolean)(overlay!=0));}
++        if(overlay){char text[320];snprintf(text,sizeof text,"FPS %.1f | frame %.2f ms | CPU %.2f ms | GPU %.2f ms | draws %.0f | passes %.0f",stats.frame_ms>0?1000/stats.frame_ms:0,stats.frame_ms,stats.cpu_ms,stats.gpu_ms,stats.draws,stats.passes);
++            jstring value=java_text(env,text);(*env)->CallVoidMethod(env,a->clazz,method,value);(*env)->DeleteLocalRef(env,value);
++            if((*env)->ExceptionCheck(env)){(*env)->ExceptionDescribe(env);(*env)->ExceptionClear(env);break;}}
++#endif
+     }
+     (*env)->DeleteLocalRef(env,klass);(*a->vm)->DetachCurrentThread(a->vm);return NULL;
+ }
+@@ -248,6 +283,18 @@ static void copy_asset(ANativeActivity *a,const char *directory,const char *name
+ }
+ static void render_mode_apply(void);
+ static void render_mode_log(void);
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++int ss_host_run(const char *directory);
++void front_run(void (*guest)(void));
++static const char *android_guest_directory;
++static void android_guest_run(void) {ss_host_run(android_guest_directory);}
++int dm_main(int argc,char **argv) {
++    if(argc!=2||!argv||!argv[1])die("Android game module directory is missing");
++    android_guest_directory=argv[1];
++    front_run(android_guest_run);
++    return 0;
++}
++#endif
+ static void *boot(void *argument) {
+     game_app *s=argument;pthread_mutex_lock(&s->lock);while(!s->window&&!s->stop)pthread_cond_wait(&s->ready,&s->lock);int stop=s->stop;pthread_mutex_unlock(&s->lock);if(stop)return NULL;
+     char path[1024],metadata[1024],log[1024];snprintf(metadata,sizeof metadata,"%s/game",s->activity->internalDataPath);mkdir(metadata,0700);
+@@ -271,6 +318,7 @@ static void *boot(void *argument) {
+             if(method&&!(*env)->ExceptionCheck(env))rate=(*env)->CallFloatMethod(env,a->clazz,method);
+             if((*env)->ExceptionCheck(env)){(*env)->ExceptionDescribe(env);(*env)->ExceptionClear(env);rate=0;}
+             double rounded=(double)rate+.5;if(rate>0&&rounded<=INT_MAX)hz=(int)rounded;
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+             // 开机外框要的窗口尺寸：当前与最大 WindowMetrics（像素）。读不到就留 0，外框只按窗口本身与档位算（posture_init）。
+             // Window sizes for the boot box: current and maximum WindowMetrics (pixels). When unavailable they stay 0 and
+             // the box is computed from the window itself and the profiles only (posture_init).
+@@ -281,6 +329,7 @@ static void *boot(void *argument) {
+                 if(values&&(*env)->GetArrayLength(env,values)==4){jint v[4];(*env)->GetIntArrayRegion(env,values,0,4,v);pthread_mutex_lock(&posture.lock);for(unsigned i=0;i<4;i++)posture.metrics[i]=v[i];pthread_mutex_unlock(&posture.lock);}
+                 if(values)(*env)->DeleteLocalRef(env,values);}
+             else LOG("[android-posture] windowMetricsForNative 不可用：开机外框只按窗口与档位算");
++#endif
+             if(klass)(*env)->DeleteLocalRef(env,klass);if(attached)(*a->vm)->DetachCurrentThread(a->vm);
+         }
+         atomic_store(&display_hz,hz);LOG("[android] display maximum refresh=%.3f Hz reported=%d Hz (read-only capability query)",rate,hz);
+@@ -306,6 +355,7 @@ static void *boot(void *argument) {
+         // A separate variable for the module directory: DM_ANDROID_LIBDIR belongs to the graphics driver's hook
+         // lookup, as documented in loader.c.
+         setenv("DM_GUEST_LIBDIR",metadata,1);
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+         // 三张游戏派生表（编年史仓库 / 经验 / 关联亮度）的内容**不在 APK 里**（壳模式）：由数据包里的 derived.tsv 提供。
+         // 没有它表就空着（会打红字），所以这里把"缺文件"说清楚，而不是让人以为是数据本身的问题。
+         // The three game-derived tables (chronicle vault / XP / level brightness) are **not compiled into the APK**
+@@ -314,15 +364,26 @@ static void *boot(void *argument) {
+         snprintf(path,sizeof path,"%s/d2r-package/derived.tsv",s->activity->externalDataPath);
+         if(access(path,R_OK)==0){setenv("DM_DERIVED",path,1);LOG("[android] 数据包带 derived.tsv：三张派生表在运行时从它读");}
+         else{unsetenv("DM_DERIVED");LOG("[android] 【红】数据包没有 derived.tsv：编年史仓库 / 经验条 / 动态亮度的表将是空的（用新版打包器重新生成数据包）");}
++#endif
+         LOG("[android] imported package in use game=%s",metadata);
+     }else{
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++        const char *modules[]=TOUCHABLE_GAME_MODULES;
++        for(unsigned i=0;i<sizeof modules/sizeof modules[0];i++)for(unsigned j=0;j<2;j++){char name[80];snprintf(name,sizeof name,"%s.%s.tsv",modules[i],j?"gates":"fixups");copy_asset(s->activity,metadata,name);}
++#else
+         const char *modules[]={"main","sdk","subsdk0"};for(unsigned i=0;i<3;i++)for(unsigned j=0;j<2;j++){char name[80];snprintf(name,sizeof name,"%s.%s.tsv",modules[i],j?"gates":"fixups");copy_asset(s->activity,metadata,name);}
++#endif
+         snprintf(path,sizeof path,"%s/romfs",s->activity->externalDataPath);setenv("DM_ROMFS",path,1);
+         snprintf(path,sizeof path,"%s/shaders",s->activity->externalDataPath);setenv("DM_VK_SHADERS",path,1);
+         unsetenv("DM_GUEST_LIBDIR");
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+         unsetenv("DM_DERIVED");
+         LOG("[android] no imported package; using APK assets and pushed romfs/shaders (derived tables will be empty)");
++#else
++        LOG("[android] using APK module metadata and pushed romfs/shaders");
++#endif
+     }
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+     // 触屏包（dm/android/tools/make_touch_pack.py 从玩家自己的游戏文件生成，不进仓库）：RomFS 覆盖层（触屏版布局、
+     // 触摸说法、底部 UI v4）、技能图集与技能索引。上游触屏方案离不开它（dm_padmode.c 要 ctrl_touch，按钮位置对着
+     // 覆盖层里的 HUD 布局），所以缺任何一项都拒绝启动并写明缺的文件，不退回旧的虚拟手柄。启动界面先查过一次。
+@@ -353,6 +414,7 @@ static void *boot(void *argument) {
+         snprintf(file,sizeof file,"%s/romfs_overlay",touch);setenv("DM_ROMFS_OVERLAY",file,1);setenv("DM_TOUCH_PACK",touch,1);setenv("DM_TOUCH_DEFAULTS","1",1);
+         LOG("[android] 触屏包 %s：RomFS 覆盖层已挂、技能索引 %d 行",touch,rows);
+     }
++#endif
+     snprintf(path,sizeof path,"%s/save",s->activity->internalDataPath);mkdir(path,0700);setenv("DM_SAVE",path,1);
+     // 私有可重建的驱动缓存独立于游戏存档；不可写时正常使用内存缓存。
+     // Keep rebuildable driver data separate from saves; an unwritable directory falls back to the in-memory cache.
+@@ -375,16 +437,21 @@ static void *boot(void *argument) {
+     // integrated build carries every branch's keys).
+     if(launch.test_hp1>=0)LOG("[android] 【红】测试开关 test_hp1=%d 生效：受控玩家的生命被压低（只给实机测试造死亡画面，产品配置不该有这个键）",launch.test_hp1);
+     if(launch.ignored_keys)LOG("[android] 启动设置：%d 个不认识的键已跳过（不影响启动）：%s%s",launch.ignored_keys,launch.ignored,launch.ignored_keys>1&&!strchr(launch.ignored,',')?" …":"");
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+     render_mode_apply();
+     // 姿态与开机外框在游戏第一次问分辨率之前定下来（DM_GAME_RES / DM_POSTURE / DM_POSTURE_BOX 都已就位）。
+     // Postures and the boot box are settled before the game first asks for a resolution (DM_GAME_RES / DM_POSTURE /
+     // DM_POSTURE_BOX are all in place by now).
+     posture_init(s);
+     render_mode_log();
++#else
++    ss_display_set_view(ANativeWindow_getWidth(s->window),ANativeWindow_getHeight(s->window));
++#endif
+     // 设置生效后立刻记一次环境，确认 DM_GAME_RES 真的传下去了（否则只会在游戏那边看到"未设"）。
+     // Immediately record the environment after the settings apply, to confirm DM_GAME_RES really got through;
+     // otherwise the only symptom is "unset" on the game side.
+     LOG("[android] 环境核对 DM_OPMODE=%s DM_GAME_RES=%s DM_DEBUG_OVERLAY=%s",getenv("DM_OPMODE")?getenv("DM_OPMODE"):"(未设)",getenv("DM_GAME_RES")?getenv("DM_GAME_RES"):"(未设)",getenv("DM_DEBUG_OVERLAY")?getenv("DM_DEBUG_OVERLAY"):"(未设)");
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+     // 诊断：开了输入收样（input_receipts=1 → DM_HID_RECEIPT_LOG）就一并记触屏收样（[touch-receipt]，touch_front.c），
+     // 两头对得上：触点 → 发布的键位 / 摇杆 → 游戏实际取到的样。
+     // Diagnostics: when input receipts are on (input_receipts=1 -> DM_HID_RECEIPT_LOG) also log touch receipts
+@@ -392,6 +459,7 @@ static void *boot(void *argument) {
+     if(getenv("DM_HID_RECEIPT_LOG"))setenv("DM_TOUCH_CONTROL_LOG","1",1);
+     setenv("DM_TACT_PREFETCH","0",1);setenv("DM_BOOTPROF","1",1);setenv("DM_DBG","1",1);
+     setenv("DM_UIMSG","1",1);setenv("DM_MOVIE","1",1);
++#endif
+     // 启动途中活动已被销毁（destroyed 设了 stop）就不起游戏。stop 与 started 在同一把锁里定先后：destroyed 要么看到 started
+     // 去关机，要么这里看到 stop 直接返回；否则 destroyed 会跳过关机，却在 pthread_join 上等一个永不返回的游戏（ANR）。
+     // If the activity was destroyed during start-up (destroyed set stop), do not start the game. stop and started are
+@@ -400,6 +468,7 @@ static void *boot(void *argument) {
+     pthread_mutex_lock(&s->lock);int stopping=s->stop;if(!stopping)atomic_store(&s->started,1);pthread_mutex_unlock(&s->lock);
+     if(stopping){LOG("[android] 启动途中活动已销毁：不起游戏");return NULL;}
+     __android_log_print(ANDROID_LOG_INFO,"D2RAndroid","Starting real game host; log: %s",log);
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+     // 三张派生表（编年史仓库 / 经验 / 亮度）在运行时从 derived.tsv 填：路径是上面才定下来的，晚于库加载时的
+     // 构造器，所以这里显式填一次。缺文件时表为空并打红字（不伪造数据）。
+     // The three derived tables (vault / XP / brightness) are filled from derived.tsv at run time: the path is only
+@@ -407,13 +476,25 @@ static void *boot(void *argument) {
+     // tables stay empty and a red line says so (nothing is invented).
+     { void dm_hud_exp_load(void); void dm_vault_load(void); void dm_bright_load(void);
+       dm_hud_exp_load(); dm_vault_load(); dm_bright_load(); }
+-    char *args[]={"dmhost-android",metadata,"main","sdk","subsdk0",NULL};int dm_main(int,char**);dm_main(5,args);ANativeActivity_finish(s->activity);return NULL;
++    char *args[]={"dmhost-android",metadata,"main","sdk","subsdk0",NULL};int dm_main(int,char**);dm_main(5,args);
++#else
++    char *args[]={"dmhost-android",metadata,NULL};dm_main(2,args);
++#endif
++    ANativeActivity_finish(s->activity);return NULL;
++}
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++void front_save_failed(int error) {
++    LOG("[android] save failed: %s",strerror(error));
++    atomic_store(&save_failure,error==ENOSPC?1:2);
+ }
++#endif
+ void front_run(void (*guest)(void)) {void mtl_init(void);mtl_init();game_app *s=application;if(!pthread_create(&s->debug_thread,NULL,progress_watch,s))s->debug_started=1;
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+     int error=pthread_create(&posture.thread,NULL,posture_thread,s);if(error)die("[android-posture] 姿态对账线程起不来 error=%d",error);posture.thread_started=1;
+-    // 触屏方案的游戏线程接线（同 iOS front_run）：UI 消息订阅、技能绑定读取。
+-    // Game-thread wiring of the touch scheme (as iOS front_run): UI-message subscription and the skill-binding reader.
++#endif
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+     dm_touch_front_attach();
++#endif
+     guest();}
+ void *front_metal_layer(void) {if(!application)return NULL;pthread_mutex_lock(&application->lock);ANativeWindow *w=application->window;pthread_mutex_unlock(&application->lock);return w;}
+ // 后端初始化取窗口：在前端锁里连同一个引用一起拿（ANativeWindow_acquire），后端换窗口 / 拆窗口时自己释放。这样即使前端随后
+@@ -422,6 +503,7 @@ void *front_metal_layer(void) {if(!application)return NULL;pthread_mutex_lock(&a
+ // the backend releases it when it replaces or drops the window, so the pointer it keeps never dangles even if the front
+ // end destroys the window right afterwards (see the ordering in window_destroyed).
+ void *dm_android_window_acquire(void) {if(!application)return NULL;pthread_mutex_lock(&application->lock);ANativeWindow *w=application->window;if(w)ANativeWindow_acquire(w);pthread_mutex_unlock(&application->lock);return w;}
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+ // ---- 姿态（摺叠 / 展开 / 分屏 / wm size）与出图尺寸（posture.h） ----
+ // 开机时主机档参数位 KRES1 = 「开机外框」（各已知姿态的原生尺寸与各档位在这些姿态下要出的尺寸取逐轴最大值，套 4096x2160 / 6.5 MP 上限）：
+ // 游戏按开机那个值建窗口贴图、之后只接受两轴都不更大的新值。第一帧取图之后（窗口初始化已经读过参数位）改给真正要出的尺寸，
+@@ -606,6 +688,14 @@ static void posture_init(game_app *s) {
+     LOG("[android-posture] 开机外框 %ux%u%s（窗口 %dx%d，当前 WindowMetrics %dx%d，最大 WindowMetrics %dx%d，posture_box %s，档位主机 %ux%u；策略 %s）→ 当前姿态主机档 %ux%u / 掌机档 %ux%u",
+         box.w, box.h, capped ? "（已按 4096x2160 / 6.5 MP 上限等比缩小）" : "", ww, wh, m[0], m[1], m[2], m[3], extra && *extra ? extra : "(未设)", profile.w, profile.h, policy == DM_POSTURE_FILL ? "fill" : "fit", d.w, d.h, h.w, h.h);
+ }
++#else
++uint64_t front_game_res(int docked) {
++    (void)docked;
++    ss_display_size size=ss_display_resolution(720);
++    return ((uint64_t)(uint32_t)size.height<<32)|(uint32_t)size.width;
++}
++uint64_t front_game_res_aspect(int docked) {return front_game_res(docked);}
++#endif
+ // 后端初始化时窗口已经没了（启动途中切后台）：等前端拿到下一块窗口，或者活动被销毁（返回 NULL）。见 nvn_vulkan.c initialize。
+ // The window is already gone when the backend initialises (backgrounded during start-up): wait for the front end's
+ // next window, or for the activity to be destroyed (returns NULL). See initialize in nvn_vulkan.c.
+@@ -617,15 +707,25 @@ void *dm_android_window_wait(void) {
+ static int text_input_request(const char *title,const char *sub,const char *guide,const char *initial,int max,char *out,int cap) {
+     if(!application||!out||cap<=0)return -1;ANativeActivity *a=application->activity;JNIEnv *env=NULL;int attached=0;
+     if((*a->vm)->GetEnv(a->vm,(void**)&env,JNI_VERSION_1_6)!=JNI_OK){if((*a->vm)->AttachCurrentThread(a->vm,&env,NULL)!=JNI_OK)return -1;attached=1;}
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+     extern int g_swkbd_name_panel,g_swkbd_numeric_max;int name=g_swkbd_name_panel,numeric=g_swkbd_numeric_max;
+     char message[2048];snprintf(message,sizeof message,"%s%s%s%s%s",sub?sub:"",sub&&*sub&&guide&&*guide?"\n":"",guide?guide:"",name?"\n":"",name?dm_ui("dmNameRule"):"");
+     if(numeric>=0)snprintf(message,sizeof message,"0 – %d",numeric);
+     const char *heading=title&&*title?title:dm_ui(name?"dmNameTitle":numeric>=0?"dmQtyTitle":"dmInputTitle");
++#else
++    int name=0,numeric=-1;
++    char message[2048];snprintf(message,sizeof message,"%s%s%s",sub?sub:"",sub&&*sub&&guide&&*guide?"\n":"",guide?guide:"");
++    const char *heading=title&&*title?title:"Text input";
++#endif
+     pthread_mutex_lock(&text_request.lock);uint64_t serial=++text_request.serial;text_request.done=0;text_request.result=-1;pthread_mutex_unlock(&text_request.lock);
+     // Java 的 UI 调度不持结果锁；回调可以在进入等待前完成。
+     // Do not hold the result lock while scheduling Java UI; the callback may complete before the wait starts.
+     jclass klass=(*env)->GetObjectClass(env,a->clazz);jmethodID method=(*env)->GetMethodID(env,klass,"requestText","(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;IIZ)V");
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++    jstring strings[4]={java_text(env,heading),java_text(env,message),java_text(env,guide),java_text(env,initial)};
++#else
+     jstring strings[4]={java_text(env,heading),java_text(env,message),java_text(env,name?dm_ui("dmNameBlankRandom"):guide),java_text(env,initial)};
++#endif
+     if(method&&!(*env)->ExceptionCheck(env))(*env)->CallVoidMethod(env,a->clazz,method,(jlong)serial,strings[0],strings[1],strings[2],strings[3],max,numeric,name?JNI_TRUE:JNI_FALSE);
+     int failed=!method||(*env)->ExceptionCheck(env);if(failed){(*env)->ExceptionDescribe(env);(*env)->ExceptionClear(env);}
+     for(unsigned i=0;i<4;i++)if(strings[i])(*env)->DeleteLocalRef(env,strings[i]);(*env)->DeleteLocalRef(env,klass);if(attached)(*a->vm)->DetachCurrentThread(a->vm);
+@@ -634,6 +734,7 @@ static int text_input_request(const char *title,const char *sub,const char *guid
+     int result=text_request.result;size_t n=strlen(text_request.text);int random_name=result>0&&name&&!n;
+     if(n>=(size_t)cap){n=cap-1;while(n&&((unsigned char)text_request.text[n]&0xc0)==0x80)n--;}
+     memcpy(out,text_request.text,n);out[n]=0;pthread_mutex_unlock(&text_request.lock);
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+     // 留空确认只填随机名，玩家看过名字后再创建；取消和普通输入不变。
+     // Confirming a blank name fills a random name for review before character creation.
+     if(random_name){
+@@ -642,6 +743,7 @@ static int text_input_request(const char *title,const char *sub,const char *guid
+         memcpy(out,generated,length+1);extern _Atomic int g_fe_name_no_accept;atomic_store(&g_fe_name_no_accept,1);
+         LOG("起名：随机名 → 名字框「%s」（名字留空点确定）",generated);   // 句式同 iOS front_ios.m 与宿主 dm_actions.c | same wording as iOS front_ios.m and the host dm_actions.c
+     }
++#endif
+     return result;
+ }
+ typedef struct { const char *title,*sub,*guide,*initial; int max,cap,result; char *out; } text_call;
+@@ -665,7 +767,9 @@ int dm_thermal_now(void) {
+ // The touch path (main thread: the AInputQueue is attached to the main Looper; dm_ctrl_touched republishes synchronously, so this is a
+ // same-thread re-entry flag): a controller-mode 1 -> 0 change meanwhile
+ // is caused by the touch and is not "controller disconnected".
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+ static _Thread_local int ctrl_touch_in_progress;
++#endif
+ static void pad_publish(game_app *s) {
+     // 实体手柄（controller.c：1P 的键已按布局换好、摇杆已过死区，触屏模式不给摇杆）与键盘（键位 + WASD）分开存、在这里合并：
+     // 抬起一个来源不会清掉另一个来源还按着的键；摇杆先用实体手柄的，键盘 WASD 按着时用它。触屏不走这里（touch_front.c）。
+@@ -674,6 +778,10 @@ static void pad_publish(game_app *s) {
+     // sticks take the physical controller's value, or WASD while held. Touch does not come through here (touch_front.c).
+     uint64_t pad;int32_t ax[4];int mode=dm_ctrl_read(&pad,ax);int32_t x=ax[0],y=ax[1],rx=ax[2],ry=ax[3];
+     if(s->move_keys){x=((!!(s->move_keys&DM_BTN_RIGHT))-(!!(s->move_keys&DM_BTN_LEFT)))*DM_STICK_MAX;y=((!!(s->move_keys&DM_BTN_UP))-(!!(s->move_keys&DM_BTN_DOWN)))*DM_STICK_MAX;}
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++    ss_android_touch_pad(pad|s->pad_buttons,x,y,mode);
++    (void)rx;(void)ry;
++#else
+     // 1P 手柄（controller.c）＋ 键盘的合并读数交给触屏前端：它按 dm_gamepad.m 的规则切手柄 / 触屏模式后再 dm_pad_set；触屏走 dm_input_set（touch_front.c）。
+     // Player 1 (controller.c) + keyboard go to the touch front end, which switches controller / touch mode by dm_gamepad.m's rules and then
+     // calls dm_pad_set; touch uses dm_input_set (touch_front.c).
+@@ -682,6 +790,7 @@ static void pad_publish(game_app *s) {
+     // The physical controllers' mode follows controller.c; the touch front end follows it (rules: dm_touch_front_controller_mode in touch_front.c).
+     // The order is a contract: the new reading first, then the mode.
+     dm_touch_front_controller_mode(mode,ctrl_touch_in_progress);
++#endif
+ }
+ static void pad_republish(void) {game_app *s=application;if(s)pad_publish(s);}
+ // 震动只在「前台、有焦点、游戏内菜单没开」时恢复；四个恢复点（关菜单、得焦点、onResume、输入队列重建）共用这一条，挂起点见 pad_clear 的调用方。
+@@ -696,9 +805,11 @@ static void pad_clear(game_app *s) {s->pad_buttons=s->move_keys=0;dm_ctrl_reset(
+ __attribute__((visibility("default"))) void Java_org_d2r_android_port_D2RActivity_setOverlayEnabled(JNIEnv *env,jclass klass,jboolean enabled) {
+     (void)env;(void)klass;atomic_store(&debug_overlay_enabled,enabled?1:0);
+ }
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+ __attribute__((visibility("default"))) void Java_org_d2r_android_port_D2RActivity_setQualityPreset(JNIEnv *env,jclass klass,jint preset) {
+     (void)env;(void)klass;dm_3d_scale_set_preset((int)preset);
+ }
++#endif
+ __attribute__((visibility("default"))) void Java_org_d2r_android_port_D2RActivity_setMenuOpen(JNIEnv *env,jclass klass,jboolean open) {
+     // 打开：清手把与触控（放开的事件会送到菜单窗口，回不到这里），震动挂起；关上：在前台且有焦点就恢复震动。
+     // 菜单弹窗是本 Activity 窗口的子窗口，实机上打开 / 关上都**不**触发 onWindowFocusChanged（logcat 没有焦点变化），所以恢复不能只靠焦点回调。
+@@ -709,11 +820,18 @@ __attribute__((visibility("default"))) void Java_org_d2r_android_port_D2RActivit
+     // 触屏前端的手指也在这里取消（三方审查 merge-m1：合并后触屏状态在 touch_front.c，pad_clear 清不到）。
+     // The touch front end's fingers are cancelled here too (three-way review merge-m1: after the merge the touch state lives in
+     // touch_front.c, which pad_clear does not reach).
+-    if(open){pad_clear(s);if(atomic_load(&s->started))dm_touch_front_cancel("menu_open");}else ctrl_maybe_resume(s);
++    if(open){pad_clear(s);if(atomic_load(&s->started)){
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++        ss_android_touch_cancel();
++#else
++        dm_touch_front_cancel("menu_open");
++#endif
++    }}else ctrl_maybe_resume(s);
+ }
+ __attribute__((visibility("default"))) void Java_org_d2r_android_port_D2RActivity_setSkipSaveOnExit(JNIEnv *env,jclass klass,jboolean skip) {
+     (void)env;(void)klass;atomic_store(&skip_save_once,skip?1:0);
+ }
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+ // 触屏前端的 Java 入口（都在 Activity 主线程：Choreographer 每帧、窗口安全区回调、绘制）。见 touch_front.h。
+ // Java entry points of the touch front end (all on the Activity main thread: per-frame Choreographer, the window
+ // insets callback, drawing). See touch_front.h.
+@@ -738,6 +856,24 @@ __attribute__((visibility("default"))) jstring Java_org_d2r_android_port_D2RActi
+ __attribute__((visibility("default"))) jstring Java_org_d2r_android_port_D2RActivity_hudLine(JNIEnv *env,jclass klass,jint which) {
+     (void)klass;char text[128];dm_touch_front_vital(which,text,sizeof text);return java_text(env,text);
+ }
++#else
++__attribute__((visibility("default"))) jint Java_org_d2r_android_port_D2RActivity_rhythmTick(JNIEnv *env,jclass klass) {
++    (void)env;(void)klass;if(!application||!atomic_load(&application->started))return 0;
++    return ss_android_touch_tick();
++}
++__attribute__((visibility("default"))) jint Java_org_d2r_android_port_D2RActivity_rhythmDraw(JNIEnv *env,jclass klass,jfloatArray out) {
++    (void)klass;if(!application||!atomic_load(&application->started)||!out)return 0;
++    jsize size=(*env)->GetArrayLength(env,out);
++    jfloat *data=(*env)->GetFloatArrayElements(env,out,NULL);if(!data)return 0;
++    int count=ss_android_touch_draw(data,size);(*env)->ReleaseFloatArrayElements(env,out,data,0);return count;
++}
++__attribute__((visibility("default"))) void Java_org_d2r_android_port_D2RActivity_rhythmMetrics(JNIEnv *env,jclass klass,jint width,jint height,jfloat density,jfloat left,jfloat top,jfloat right,jfloat bottom) {
++    (void)env;(void)klass;ss_android_touch_metrics(width,height,density,left,top,right,bottom);
++}
++__attribute__((visibility("default"))) void Java_org_d2r_android_port_D2RActivity_rhythmCancel(JNIEnv *env,jclass klass) {
++    (void)env;(void)klass;if(application&&atomic_load(&application->started))ss_android_touch_cancel();
++}
++#endif
+ static uint64_t pad_key(int key) {
+     switch(key){case AKEYCODE_DPAD_UP:return DM_BTN_UP;case AKEYCODE_DPAD_DOWN:return DM_BTN_DOWN;case AKEYCODE_DPAD_LEFT:return DM_BTN_LEFT;case AKEYCODE_DPAD_RIGHT:return DM_BTN_RIGHT;
+         case AKEYCODE_ENTER:case AKEYCODE_SPACE:return DM_BTN_A;case AKEYCODE_ESCAPE:return DM_BTN_B;default:return 0;}   // 键盘；手柄键（BUTTON_*）归 controller.c | keyboard; pad keys (BUTTON_*) belong to controller.c
+@@ -767,8 +903,13 @@ static int input_ready(int fd,int events,void *data) {
+             // All touches go to the touch front end (the upstream iOS touch scheme; the picture rect comes from WP1's mtl_screen_rect,
+             // scaled to the current window); a press also tells controller.c (rumble stops, no controller sticks in touch mode). Switching controller /
+             // touch mode (a touch in controller mode only switches back and is not executed) is done by the touch front end by dm_gamepad.m's rules.
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++            if((AMotionEvent_getAction(event)&AMOTION_EVENT_ACTION_MASK)==AMOTION_EVENT_ACTION_DOWN)dm_ctrl_touched();
++            handled=ss_android_touch_motion(event);
++#else
+             if((AMotionEvent_getAction(event)&AMOTION_EVENT_ACTION_MASK)==AMOTION_EVENT_ACTION_DOWN){ctrl_touch_in_progress=1;dm_ctrl_touched();ctrl_touch_in_progress=0;}
+             handled=dm_touch_front_motion(event);
++#endif
+         }else if(AInputEvent_getType(event)==AINPUT_EVENT_TYPE_KEY){int key=AKeyEvent_getKeyCode(event),down=AKeyEvent_getAction(event)==AKEY_EVENT_ACTION_DOWN;uint64_t button=pad_key(key),move=key==AKEYCODE_W?DM_BTN_UP:key==AKEYCODE_A?DM_BTN_LEFT:key==AKEYCODE_S?DM_BTN_DOWN:key==AKEYCODE_D?DM_BTN_RIGHT:0;
+             if(button){uint64_t before=s->pad_buttons;if(down)s->pad_buttons|=button;else s->pad_buttons&=~button;handled=1;
+                 // 键盘这条路也记（手柄键在 controller.c 记）：只在位掩码真的变了才记，连按不放不会刷屏。
+@@ -779,6 +920,7 @@ static int input_ready(int fd,int events,void *data) {
+         AInputQueue_finishEvent(s->input,event,handled);
+     }return 1;
+ }
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+ // 退出前请游戏存盘并等它提交，最多 3 秒。
+ // 游戏自己的定时存盘是 5 分钟一次，且没有"切后台就存"这条路：不请它，从上次提交到现在的进度就没了。
+ // Mac（front_mac.m 的 app_quit）与 iOS（front_ios.m 进后台）都做了这件事，安卓原先漏了。
+@@ -807,6 +949,7 @@ static void settle_save(void) {
+     if(last!=c0&&asked)LOG("[android] 退出前等游戏存盘 %.0f ms，期间存档提交 %llu 次%s",(now_ns()-t0)/1e6,(unsigned long long)(last-c0),paused?"（原先停在暂停菜单/面板，已放开）":"");
+     else LOG("[android] 【红】未存盘退出：3 秒内没等到存档提交（%s%s）",asked?"已请游戏存盘":"不处于可请存盘的状态",paused?"，原先暂停着、已放开":"");
+ }
++#endif
+ static void window_created(ANativeActivity *a,ANativeWindow *w) {game_app *s=a->instance;pthread_mutex_lock(&s->lock);ANativeWindow_acquire(w);s->window=w;s->frame_rate_attempted=0;pthread_cond_signal(&s->ready);pthread_mutex_unlock(&s->lock);
+     // 游戏已在跑时这块窗口是"从后台回来"的新窗口：挂起期间重建表面与交换链（此刻游戏线程被挡在 NVN 入口外，不会争）。
+     // When the game is already running this is the new window from returning to the foreground: rebuild the surface
+@@ -816,7 +959,9 @@ static void window_created(ANativeActivity *a,ANativeWindow *w) {game_app *s=a->
+         // 后台期间可能换了姿态（合上 / 打开摺叠屏）：新窗口的尺寸照样进姿态对账。
+         // The posture may have changed while in the background (folded / unfolded): the new window's size goes through
+         // posture reconciliation as well.
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+         posture_window(w,"新窗口");
++#endif
+         // mtl_screen_attach 自己先挂起（重建交换链时游戏线程不能在外面读它），但**不**放开：这个回调与
+         // onResume 的先后由系统决定，真机实测是"图形恢复（onResume）先、窗口后"，所以迟到时必须在这里按
+         // 当前是否在前台把状态摆回去；否则那次挂起没人解除，游戏会永远卡在出图上。
+@@ -833,7 +978,11 @@ static void window_created(ANativeActivity *a,ANativeWindow *w) {game_app *s=a->
+         // rotation passes through neither onPause nor onResume, so nothing would unfreeze it and the game would stop
+         // ticking forever. A window handed to us in the foreground means it should be running: on the normal
+         // return-from-background path onResume already released it, so this is an idempotent no-op there.
+-        if(atomic_load(&s->activity_resumed)){dm_gfx_suspend(0);guest_clock_freeze_for(1,0);}}}
++        if(atomic_load(&s->activity_resumed)){dm_gfx_suspend(0);
++#ifndef TOUCHABLE_SWITCH_RUNTIME
++            guest_clock_freeze_for(1,0);
++#endif
++        }}}
+ // 旋转或窗口尺寸变化（摺叠 / 展开 / 分屏 / wm size；配置变化时安卓不重建窗口，只改尺寸，所以不会走 window_destroyed/created）：
+ // 交换链是按建链时的尺寸建的，不重建的话新画面会被合成器按旧尺寸拉伸或裁掉。这里**只标记**（mtl_screen_resized），
+ // 由游戏线程在下一次出图的帧开头、在同一个表面上重建交换链（nvn_vulkan.c）：回调线程上既不挂起也不重建，
+@@ -857,7 +1006,10 @@ static void window_resized(ANativeActivity *a,ANativeWindow *w) {game_app *s=a->
+     // yet the mark is harmless and initialisation builds the swapchain at the size of that moment.
+     if(same_window&&atomic_load(&s->started)){void mtl_screen_resized(void);mtl_screen_resized();
+         LOG("[android] 窗口尺寸变化 %dx%d：交换链在下一帧开头按新尺寸重建（游戏线程），进程与本局保留",ANativeWindow_getWidth(w),ANativeWindow_getHeight(w));
+-        posture_window(w,"窗口改尺寸");}}
++#ifndef TOUCHABLE_SWITCH_RUNTIME
++        posture_window(w,"窗口改尺寸");
++#endif
++    }}
+ // 配置变化（摺叠 / 屏幕尺寸 / 密度 / 夜间模式等，全部已在清单 configChanges 里声明）：活动不重建、游戏保留，只记一行作证据。
+ // A configuration change (fold / screen size / density / night mode etc., all declared in the manifest's
+ // configChanges): the activity is not recreated and the game stays; only a line is logged as evidence.
+@@ -885,12 +1037,22 @@ static void window_destroyed(ANativeActivity *a,ANativeWindow *w) {game_app *s=a
+     // After saving and freezing but before tearing down the surface, take the window off the front end: nobody can
+     // pick this window up any more (backend initialisation waits for the next one instead), while the front end's own
+     // reference is only dropped after detach has torn down the backend's surface.
+-    if(atomic_load(&s->started)){settle_save();guest_clock_freeze_for(1,1);}
++    if(atomic_load(&s->started)){
++#ifndef TOUCHABLE_SWITCH_RUNTIME
++        settle_save();guest_clock_freeze_for(1,1);
++#endif
++    }
+     pthread_mutex_lock(&s->lock);int owned=s->window==w;if(owned)s->window=NULL;pthread_mutex_unlock(&s->lock);
+     if(atomic_load(&s->started)){void mtl_screen_detach(void);mtl_screen_detach();LOG("[android] 窗口销毁：保留进程等待回到前台");}
+     if(owned)ANativeWindow_release(w);}
+ static void input_created(ANativeActivity *a,AInputQueue *q) {game_app *s=a->instance;s->input=q;AInputQueue_attachLooper(q,ALooper_forThread(),0,input_ready,s);ctrl_maybe_resume(s);}
+-static void input_destroyed(ANativeActivity *a,AInputQueue *q) {game_app *s=a->instance;AInputQueue_detachLooper(q);s->input=NULL;pad_clear(s);if(atomic_load(&s->started))dm_touch_front_cancel("input_destroyed");}
++static void input_destroyed(ANativeActivity *a,AInputQueue *q) {game_app *s=a->instance;AInputQueue_detachLooper(q);s->input=NULL;pad_clear(s);if(atomic_load(&s->started)){
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++        ss_android_touch_cancel();
++#else
++        dm_touch_front_cancel("input_destroyed");
++#endif
++    }}
+ // 注意 onPause 里**不**挂起图形（Mac 的最小化路径有这一步，安卓不能照抄）：安卓在停下来之后一定会销毁窗口，
+ // 而"请游戏存盘"排在窗口销毁之前（见 window_destroyed）。图形一旦在这里挂起，游戏线程就被挡在 NVN 入口外，
+ // 请求的那次自动存盘永远等不到提交 —— 真机上就是这样，日志里只剩一条"未存盘退出"的红字。真正的挂起由
+@@ -907,12 +1069,31 @@ static void input_destroyed(ANativeActivity *a,AInputQueue *q) {game_app *s=a->i
+ // first seconds back are recovery (surface rebuild, cold caches), and without telling the controller they are read
+ // as GPU pressure and the internal 3D ratio is scaled down; ② lifting the guest clock freeze, pairing with the
+ // freeze taken when going to the background.
+-static void focus_changed(ANativeActivity *a,int focused) {game_app *s=a->instance;if(focused){s->has_focus=1;ctrl_maybe_resume(s);}else{s->has_focus=0;pad_clear(s);if(atomic_load(&s->started))dm_touch_front_cancel("focus_lost");}}
++static void focus_changed(ANativeActivity *a,int focused) {game_app *s=a->instance;if(focused){ss_haptics_suspend_for(SS_HAPTICS_INACTIVE,0);s->has_focus=1;ctrl_maybe_resume(s);}else{ss_haptics_suspend_for(SS_HAPTICS_INACTIVE,1);s->has_focus=0;pad_clear(s);if(atomic_load(&s->started)){
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++        ss_android_touch_cancel();
++#else
++        dm_touch_front_cancel("focus_lost");
++#endif
++    }}}
+ // 回前台时放弃过的姿态对账重新给机会。| Back in the foreground, a posture reconciliation that gave up gets another chance.
+-static void resumed(ANativeActivity *a) {game_app *s=a->instance;atomic_store(&s->activity_resumed,1);ctrl_maybe_resume(s);
+-    pthread_mutex_lock(&posture.lock);dm_posture_reconcile_rearm(&posture.reconcile);pthread_mutex_unlock(&posture.lock);dm_android_performance_resume();if(atomic_load(&s->started)){dm_3d_scale_resumed();dm_gfx_suspend(0);guest_clock_freeze_for(1,0);dm_audio_suspend(0);dm_focus_set(1);}}
+-static void paused(ANativeActivity *a) {game_app *s=a->instance;atomic_store(&s->activity_resumed,0);pad_clear(s);if(atomic_load(&s->started))dm_touch_front_cancel("pause");if(atomic_load(&s->started)){dm_focus_set(3);dm_audio_suspend(1);}dm_android_performance_close();}
+-static void destroyed(ANativeActivity *a) {game_app *s=a->instance;atomic_store(&s->debug_stop,1);dm_ctrl_shutdown();
++static void resumed(ANativeActivity *a) {game_app *s=a->instance;ss_haptics_suspend_for(SS_HAPTICS_INACTIVE,0);atomic_store(&s->activity_resumed,1);ctrl_maybe_resume(s);
++#ifndef TOUCHABLE_SWITCH_RUNTIME
++    pthread_mutex_lock(&posture.lock);dm_posture_reconcile_rearm(&posture.reconcile);pthread_mutex_unlock(&posture.lock);
++#endif
++    dm_android_performance_resume();if(atomic_load(&s->started)){
++#ifndef TOUCHABLE_SWITCH_RUNTIME
++        dm_3d_scale_resumed();guest_clock_freeze_for(1,0);
++#endif
++        dm_gfx_suspend(0);dm_audio_suspend(0);dm_focus_set(1);}}
++static void paused(ANativeActivity *a) {game_app *s=a->instance;ss_haptics_suspend_for(SS_HAPTICS_INACTIVE,1);atomic_store(&s->activity_resumed,0);pad_clear(s);if(atomic_load(&s->started)){
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++        ss_android_touch_cancel();
++#else
++        dm_touch_front_cancel("pause");
++#endif
++        dm_focus_set(3);dm_audio_suspend(1);}dm_android_performance_close();}
++static void destroyed(ANativeActivity *a) {game_app *s=a->instance;ss_haptics_suspend_for(SS_HAPTICS_INACTIVE,1);atomic_store(&s->debug_stop,1);dm_ctrl_shutdown();
+     // 一个进程只跑一个游戏：活动因**没声明**的配置变化被销毁重建时，游戏没法换绑到新活动上，只能照常存盘后整个进程退出。
+     // 这里把这种情况记成红字，免得看起来像崩溃（configChanges 已覆盖摺叠 / 尺寸 / 密度 / 语言等，正常不会走到）。
+     // One game per process: when the activity is destroyed and recreated for an **undeclared** configuration change,
+@@ -932,15 +1113,25 @@ static void destroyed(ANativeActivity *a) {game_app *s=a->instance;atomic_store(
+     // and the commit could arrive. Here graphics are already suspended, so asking again cannot produce a commit — it
+     // would only waste three seconds and log a false red alarm (which is exactly what a normal exit did on device).
+     // Ask here only when the window is still present, i.e. window_destroyed never ran.
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+     pthread_mutex_lock(&s->lock);int window_present=s->window!=NULL;pthread_mutex_unlock(&s->lock);
++#endif
+     // 先叫醒还在等窗口的后端初始化（dm_android_window_wait 见 stop 就返回）：dm_host_shutdown 挂起图形时会经 mtl_drain 碰到
+     // 还没做完的 pthread_once，否则只能等 1.5 秒兜底超时（Opus 审查 MINOR）。
+     // Wake a backend initialisation still waiting for a window first (dm_android_window_wait returns on stop):
+     // dm_host_shutdown suspends graphics and reaches the unfinished pthread_once through mtl_drain, which otherwise only
+     // ends with the 1.5-second fallback timeout (Opus review MINOR).
+     pthread_mutex_lock(&s->lock);s->stop=1;pthread_cond_broadcast(&s->ready);pthread_mutex_unlock(&s->lock);
+-    if(atomic_load(&s->started)){if(window_present)settle_save();dm_host_shutdown("Android activity destroyed");}
+-    pthread_mutex_lock(&s->lock);s->stop=1;pthread_cond_signal(&s->ready);pthread_mutex_unlock(&s->lock);pthread_join(s->worker,NULL);if(s->debug_started)pthread_join(s->debug_thread,NULL);if(posture.thread_started){pthread_join(posture.thread,NULL);posture.thread_started=0;}if(s->window)ANativeWindow_release(s->window);free(s);application=NULL;}
++    if(atomic_load(&s->started)){
++#ifndef TOUCHABLE_SWITCH_RUNTIME
++        if(window_present)settle_save();
++#endif
++        dm_host_shutdown("Android activity destroyed");}
++    pthread_mutex_lock(&s->lock);s->stop=1;pthread_cond_signal(&s->ready);pthread_mutex_unlock(&s->lock);pthread_join(s->worker,NULL);if(s->debug_started)pthread_join(s->debug_thread,NULL);
++#ifndef TOUCHABLE_SWITCH_RUNTIME
++    if(posture.thread_started){pthread_join(posture.thread,NULL);posture.thread_started=0;}
++#endif
++    if(s->window)ANativeWindow_release(s->window);free(s);application=NULL;}
+ // 摺叠机版面（fold_state.c）。| The foldable layout (fold_state.c).
+ void Java_org_d2r_android_port_D2RActivity_foldObserve(JNIEnv *env,jclass klass,jint feature,jint left,jint top,jint right,jint bottom,jfloat angle,jint flags);
+ jint Java_org_d2r_android_port_D2RActivity_foldLayout(JNIEnv *env,jclass klass,jintArray out);
+@@ -949,14 +1140,23 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
+     // NativeActivity dlopens its library without Java class-loader native-library registration; explicitly register text and touch callbacks.
+     jclass klass=(*a->env)->GetObjectClass(a->env,a->clazz);JNINativeMethod methods[]={
+         {"onTextResult","(JLjava/lang/String;Z)V",(void*)Java_org_d2r_android_port_D2RActivity_onTextResult},
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++        {"rhythmTick","()I",(void*)Java_org_d2r_android_port_D2RActivity_rhythmTick},
++        {"rhythmDraw","([F)I",(void*)Java_org_d2r_android_port_D2RActivity_rhythmDraw},
++        {"rhythmMetrics","(IIFFFFF)V",(void*)Java_org_d2r_android_port_D2RActivity_rhythmMetrics},
++        {"rhythmCancel","()V",(void*)Java_org_d2r_android_port_D2RActivity_rhythmCancel},
++#else
+         {"touchTick","()I",(void*)Java_org_d2r_android_port_D2RActivity_touchTick},
+         {"touchDraw","([F)I",(void*)Java_org_d2r_android_port_D2RActivity_touchDraw},
+         {"touchMetrics","(IIFFFFFZ)V",(void*)Java_org_d2r_android_port_D2RActivity_touchMetrics},
+         {"touchCancel","()V",(void*)Java_org_d2r_android_port_D2RActivity_touchCancel},
+         {"uiText","(Ljava/lang/String;)Ljava/lang/String;",(void*)Java_org_d2r_android_port_D2RActivity_uiText},
+         {"hudLine","(I)Ljava/lang/String;",(void*)Java_org_d2r_android_port_D2RActivity_hudLine},
++#endif
+         {"setOverlayEnabled","(Z)V",(void*)Java_org_d2r_android_port_D2RActivity_setOverlayEnabled},
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+         {"setQualityPreset","(I)V",(void*)Java_org_d2r_android_port_D2RActivity_setQualityPreset},
++#endif
+         {"setMenuOpen","(Z)V",(void*)Java_org_d2r_android_port_D2RActivity_setMenuOpen},
+         {"setSkipSaveOnExit","(Z)V",(void*)Java_org_d2r_android_port_D2RActivity_setSkipSaveOnExit},
+         {"foldObserve","(IIIIIFI)V",(void*)Java_org_d2r_android_port_D2RActivity_foldObserve},
+diff --git a/dm/android/native/nvn_vulkan.c b/dm/android/native/nvn_vulkan.c
+index 710bcde..5250e61 100644
+--- a/dm/android/native/nvn_vulkan.c
++++ b/dm/android/native/nvn_vulkan.c
+@@ -1703,6 +1703,10 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
+         pthread_mutex_lock(&screen_rect_lock); screen_rect[0] = x; screen_rect[1] = y; screen_rect[2] = dw; screen_rect[3] = dh;
+         screen_rect_extent[0] = screen_extent.width; screen_rect_extent[1] = screen_extent.height; screen_rect_valid = 1; pthread_mutex_unlock(&screen_rect_lock);
+         VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}, .srcOffsets = {{sx,sy,0},{sx+sw,sy+sh,1}}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}, .dstOffsets = {{x,y,0},{x+dw,y+dh,1}}};
++#ifdef SS_NVN_LOWER_LEFT_ORIGIN
++        // Convert bottom-up guest rows only at the display boundary.
++        blit.srcOffsets[0].y=sy+sh; blit.srcOffsets[1].y=sy;
++#endif
+         vkCmdBlitImage(command, e->image, VK_IMAGE_LAYOUT_GENERAL, screen_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; barrier.dstAccessMask = 0; barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+@@ -1895,8 +1899,21 @@ void mtl_create_ns(uint64_t *lib, uint64_t *pso) { *lib = resource_created_ns[0]
+ uint64_t mtl_upload_bytes(void) { return 0; }
+ void mtl_alloc_stats(uint64_t *wait, uint64_t *grow, int *n) { *wait = *grow = 0; *n = 1; }
+ uint32_t mtl_present_qos(void) { return 0; }
+-int mtl_fps_target(void) { int dm_fps_setting(void); return dm_fps_setting(); }
++int mtl_fps_target(void) {
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++    extern int ss_display_hz(void);
++    return ss_display_hz();
++#else
++    int dm_fps_setting(void); return dm_fps_setting();
++#endif
++}
+ void mtl_mem_stat(unsigned long long frame, unsigned long long mb, int ok, unsigned long long total, unsigned long long free_size, unsigned long long max) { (void)ok; (void)total; (void)free_size; (void)max; LOG("[vulkan] frame=%llu resident=%llu MB submits=%llu allocations=%llu reuse=%llu snapshots=%llu MB pipelines=%llu/%llu", frame, mb, (unsigned long long)atomic_load(&submitted), (unsigned long long)buffer_allocations, (unsigned long long)buffer_reuses, (unsigned long long)(snapshot_bytes >> 20), (unsigned long long)pipeline_creations, (unsigned long long)pipeline_reuses); }
+ void mtl_ui_ghost(int on, float px, float py, const float grid[4], float cx, float cy) { (void)on; (void)px; (void)py; (void)grid; (void)cx; (void)cy; }
+ int mtl_ui_ghost_rect(float r[4]) { (void)r; return 0; }
+-void dm_gfx_shot_at(long frame, const char *path) { (void)frame; dm_shot_written(path, 0); }
++void dm_gfx_shot_at(long frame, const char *path) {
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++    LOG("Screenshot request at frame %ld is unsupported by the Android Vulkan backend: %s", frame, path);
++#else
++    (void)frame; dm_shot_written(path, 0);
++#endif
++}
+diff --git a/dm/android/native/nvn_vulkan_delta.inc b/dm/android/native/nvn_vulkan_delta.inc
+index d1ec034..1d7887b 100644
+--- a/dm/android/native/nvn_vulkan_delta.inc
++++ b/dm/android/native/nvn_vulkan_delta.inc
+@@ -11,8 +11,12 @@ static uint64_t gpu_snapshot_encoded;
+ // Advance only after an outer real draw/dispatch is recorded; internal helper dispatches cannot clear pending bindings.
+ static void gpu_snapshot_consumer_encoded(void) {if(++gpu_snapshot_encoded==UINT64_MAX)die("Vulkan GPU consumer serial overflow");}
+ static int gpu_snapshot_api(void) {
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++    return 0; // Android has no guest snapshot transaction or dirty tracker.
++#else
+     return dm_guest_snapshot_try_begin&&dm_guest_snapshot_end&&dm_guest_host_write_begin&&dm_guest_host_write_end&&
+         nvn_dirty_snapshot_begin&&nvn_dirty_snapshot_end&&nvn_dirty_snapshot_abort;
++#endif
+ }
+ static void gpu_snapshot_report(void) {
+     static uint64_t frame;static gpu_snapshot_counters previous;
+diff --git a/dm/android/native/nvn_vulkan_draw.inc b/dm/android/native/nvn_vulkan_draw.inc
+index 5a631fc..dabbc68 100644
+--- a/dm/android/native/nvn_vulkan_draw.inc
++++ b/dm/android/native/nvn_vulkan_draw.inc
+@@ -63,6 +63,10 @@ static VkResult graphics_pipeline_create(const pipeline_key *key,shader_entry *v
+     VkViewport viewport={0,0,1,1,0,1};VkRect2D scissor={{0,0},{1,1}};
+     VkPipelineViewportStateCreateInfo view={.sType=VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,.viewportCount=1,.pViewports=&viewport,.scissorCount=1,.pScissors=&scissor};
+     VkPipelineRasterizationStateCreateInfo raster={.sType=VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,.polygonMode=VK_POLYGON_MODE_FILL,.cullMode=key->polygon.cull,.frontFace=key->polygon.front?VK_FRONT_FACE_COUNTER_CLOCKWISE:VK_FRONT_FACE_CLOCKWISE,.depthBiasEnable=!!key->polygon.offset_en,.lineWidth=1};
++#ifdef SS_NVN_LOWER_LEFT_ORIGIN
++    // A positive viewport reverses winding relative to the upper-left path.
++    raster.frontFace=key->polygon.front?VK_FRONT_FACE_CLOCKWISE:VK_FRONT_FACE_COUNTER_CLOCKWISE;
++#endif
+     VkPipelineMultisampleStateCreateInfo multi={.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT,.alphaToCoverageEnable=key->multisample.a2c};
+     VkPipelineDepthStencilStateCreateInfo ds={.sType=VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,.depthTestEnable=key->depth.dt,.depthWriteEnable=key->depth.dw,.depthCompareOp=key->depth.df?key->depth.df-1:VK_COMPARE_OP_ALWAYS,.stencilTestEnable=key->depth.st};
+     ds.front.failOp=key->depth.fail_f?key->depth.fail_f-1:VK_STENCIL_OP_KEEP;ds.front.passOp=key->depth.zpass_f?key->depth.zpass_f-1:VK_STENCIL_OP_KEEP;ds.front.depthFailOp=key->depth.zfail_f?key->depth.zfail_f-1:VK_STENCIL_OP_KEEP;ds.front.compareOp=key->depth.sf_f?key->depth.sf_f-1:VK_COMPARE_OP_ALWAYS;
+@@ -152,9 +156,11 @@ static void draw_graphics_inner(const p_draw *draw,const p_draw_idx *indexed) {
+     if(depth_ranges_count<12){memcpy(&depth_range_bits,&state.depth_range,sizeof depth_range_bits);unsigned i=0;while(i<depth_ranges_count&&depth_ranges_seen[i]!=depth_range_bits)i++;
+         if(i==depth_ranges_count){depth_ranges_seen[depth_ranges_count++]=depth_range_bits;LOG("[vulkan-depth] range=%g,%g test=%u write=%u compare=%u target=%s",viewport.minDepth,viewport.maxDepth,(unsigned)state.depth.dt,(unsigned)state.depth.dw,(unsigned)state.depth.df,state.rt.depth?"depth":"color-only");}}
+     int x=state.scissor.x>0?state.scissor.x:0,y=state.scissor.y>0?state.scissor.y:0;int sw=state.scissor.w>0?state.scissor.w:width,sh=state.scissor.h>0?state.scissor.h:height;if(x+sw>(int)width)sw=width-x;if(y+sh>(int)height)sh=height-y;if(sw<0||sh<0)die("Vulkan scissor outside target");VkRect2D scissor={{x,y},{sw,sh}};
+-    // Metal 的裁剪空间 Y 向上，Vulkan 的正高度视口 Y 向下；用负高度保持 NVN 画面方向。
+-    // Metal clip Y points up while Vulkan's positive viewport points down; a negative viewport preserves NVN orientation.
++    // Lower-left NVN images keep row zero at the bottom, including offscreen targets.
++    // Upper-left games retain the negative viewport. Only presentation flips lower-left images.
++#ifndef SS_NVN_LOWER_LEFT_ORIGIN
+     viewport.y += viewport.height; viewport.height = -viewport.height;
++#endif
+     pipeline_key key={.vs=vs,.fs=fs,.colors=state.rt.n,.primitive=primitive,.color=state.color,.mask=state.mask,.polygon=state.polygon,.depth=depth.attachment!=VK_ATTACHMENT_UNUSED?state.depth:(ds_st){0},.multisample=state.multisample,.attachments=na,.depth_attachment=depth.attachment};
+ #ifdef __ANDROID__
+     key.required_subgroup_size=vk_api.requested_subgroup_size;
+diff --git a/dm/android/native/nvn_vulkan_handles.inc b/dm/android/native/nvn_vulkan_handles.inc
+index b708056..67afd1e 100644
+--- a/dm/android/native/nvn_vulkan_handles.inc
++++ b/dm/android/native/nvn_vulkan_handles.inc
+@@ -4,6 +4,11 @@ static unsigned shader_handle_bank(const shader_binding *binding,unsigned operan
+     if(binding->cb_slot==UINT32_MAX)return 2;unsigned primary=binding->cb_slot&0xffff,secondary=binding->cb_slot>>16;
+     return operand?(secondary?secondary-1:primary):primary;
+ }
++static int shader_immediate_texture_slot(unsigned offset) {
++    // Immediate TLD handles use c2 words 8, 10, ... for texture slots 0, 1, ... .
++    if(offset<0x20||offset>=0x420||((offset-0x20)&7))return -1;
++    return (offset-0x20)/8;
++}
+ static uint32_t shader_handle_word(unsigned stage,unsigned bank,unsigned offset) {
+     if(stage>=6)die("Vulkan texture-handle stage %u",stage);
+     // 当前全部 6,931 个游戏 shader 均从 c2 取句柄；其他常量银行不允许静默错绑。
+@@ -17,6 +22,7 @@ static uint32_t shader_handle_word(unsigned stage,unsigned bank,unsigned offset)
+ }
+ static uint32_t shader_handle(const shader_binding *binding,unsigned stage,unsigned element) {
+     unsigned type=binding->handle>>28,offset0=(binding->handle&0x3fff)*4,offset1=((binding->handle>>14)&0x3fff)*4;
++    if(binding->cb_slot==UINT32_MAX&&type==0){int slot=shader_immediate_texture_slot(offset0+8*element);return slot>=0?state.textures[stage][slot]:0;}
+     uint32_t first=shader_handle_word(stage,shader_handle_bank(binding,0),offset0+8*element);
+     switch(type){
+         case 0:return first;
+@@ -28,6 +34,7 @@ static uint32_t shader_handle(const shader_binding *binding,unsigned stage,unsig
+ }
+ static int shader_texture_slot(const shader_binding *binding,unsigned element) {
+     unsigned offsets[2]={(binding->handle&0x3fff)*4,((binding->handle>>14)&0x3fff)*4},count=(binding->handle>>28)==1||((binding->handle>>28)==2)?2:1;
++    if(binding->cb_slot==UINT32_MAX&&(binding->handle>>28)==0)return shader_immediate_texture_slot(offsets[0]+8*element);
+     for(unsigned i=0;i<count;i++){unsigned offset=offsets[i]+8*element;if(shader_handle_bank(binding,i)==2&&offset>=0x168&&offset<0x568&&!(offset&7))return (offset-0x168)/8;}
+     return -1;
+ }
+diff --git a/dm/android/native/nvn_vulkan_probe.inc b/dm/android/native/nvn_vulkan_probe.inc
+index e361e4f..b8ef5fd 100644
+--- a/dm/android/native/nvn_vulkan_probe.inc
++++ b/dm/android/native/nvn_vulkan_probe.inc
+@@ -4,7 +4,7 @@
+ #define DM_ANDROID_VULKAN_PROBE_INCLUDED
+ #include <sys/stat.h>
+ #include <float.h>
+-typedef struct probe_image { uint64_t serial;uint32_t mip,layer;unsigned priority,roi_x,roi_y,roi_w,roi_h;struct probe_image *next; } probe_image;
++typedef struct probe_image { uint64_t serial;uint32_t mip,layer;unsigned priority,roi_x,roi_y,roi_w,roi_h;int full;struct probe_image *next; } probe_image;
+ typedef struct probe_read { uint64_t serial;nvn_texdesc texture;uint32_t mip,layer,x,y,w,h,d,bpb,bw,bh;vk_buffer buffer;struct probe_read *next; } probe_read;
+ typedef struct probe_buffer_read { vk_buffer source,readback;uint64_t offset,size;char name[160];struct probe_buffer_read *next; } probe_buffer_read;
+ typedef struct probe_dump_seen { uintptr_t address;uint64_t size,hash;unsigned role;char key[17],name[160];struct probe_dump_seen *next; } probe_dump_seen;
+@@ -17,15 +17,18 @@ typedef struct probe_cs_buffer {unsigned dispatch,binding,element,writable;VkDes
+ static probe_cs_buffer *probe_cs_buffers;
+ static struct {unsigned id;char key[17];probe_cs_buffer *first;} probe_cs_pending;
+ static unsigned probe_cs_count;static uint64_t probe_cs_bytes;static char probe_cs_key[17];
++static unsigned probe_texture_id;
++static int probe_texture_selected;
+ static const char *graphics_probe_role(unsigned role) {static const char *names[]={"uniform","vertex","ssbo","texel"};return role<4?names[role]:"buffer";}
+ static void graphics_probe_configure(void) {
+     if(probe_checked)return;probe_checked=1;const char *frame=getenv("DM_VK_PROBE_FRAME"),*dir=getenv("DM_VK_PROBE_DIR"),*temp=getenv("DM_TEMP");
+     if(frame)probe_frame=strtoull(frame,NULL,10);
+     if(dir&&*dir)snprintf(probe_directory,sizeof probe_directory,"%s",dir);else if(temp&&*temp)snprintf(probe_directory,sizeof probe_directory,"%s/gpu-probe",temp);
+     if(!frame&&temp&&*temp){char path[1024],line[1024];snprintf(path,sizeof path,"%s/gpu-probe.request",temp);FILE *request=fopen(path,"r");
+-        if(request){if(fgets(line,sizeof line,request))probe_frame=strtoull(line,NULL,10);if(fgets(line,sizeof line,request)){line[strcspn(line,"\r\n")]=0;if(*line)snprintf(probe_directory,sizeof probe_directory,"%s",line);}if(fgets(line,sizeof line,request)){line[strcspn(line,"\r\n")]=0;if(strlen(line)>16)die("Vulkan probe shader key length");strcpy(probe_cs_key,line);}fclose(request);}}
++        if(request){if(fgets(line,sizeof line,request))probe_frame=strtoull(line,NULL,10);if(fgets(line,sizeof line,request)){line[strcspn(line,"\r\n")]=0;if(*line)snprintf(probe_directory,sizeof probe_directory,"%s",line);}if(fgets(line,sizeof line,request)){line[strcspn(line,"\r\n")]=0;if(strlen(line)>16)die("Vulkan probe shader key length");strcpy(probe_cs_key,line);}if(fgets(line,sizeof line,request))probe_texture_id=strtoul(line,NULL,10);fclose(request);}}
+     const char *key=getenv("DM_VK_PROBE_SHADER");if(key){if(strlen(key)>16)die("Vulkan probe shader key length");strcpy(probe_cs_key,key);}if(*probe_cs_key){if(strlen(probe_cs_key)!=16)die("Vulkan probe shader key length");for(unsigned i=0;i<16;i++)if(!((probe_cs_key[i]>='0'&&probe_cs_key[i]<='9')||(probe_cs_key[i]>='a'&&probe_cs_key[i]<='f')))die("Vulkan probe shader key must be lowercase hex");}
+-    if(probe_frame&&*probe_directory){if(mkdir(probe_directory,0700)&&errno!=EEXIST)die("Vulkan probe directory %s",probe_directory);char path[1200];snprintf(path,sizeof path,"%s/pipeline.tsv",probe_directory);probe_trace=fopen(path,"w");if(!probe_trace)die("Vulkan probe trace open");LOG("[vulkan-probe] requested frame=%llu directory=%s",(unsigned long long)probe_frame,probe_directory);}
++    const char *texture_id=getenv("DM_VK_PROBE_TEXTURE");if(texture_id)probe_texture_id=strtoul(texture_id,NULL,10);
++    if(probe_frame&&*probe_directory){if(mkdir(probe_directory,0700)&&errno!=EEXIST)die("Vulkan probe directory %s",probe_directory);char path[1200];snprintf(path,sizeof path,"%s/pipeline.tsv",probe_directory);probe_trace=fopen(path,"w");if(!probe_trace)die("Vulkan probe trace open");LOG("[vulkan-probe] requested frame=%llu directory=%s texture_id=%u",(unsigned long long)probe_frame,probe_directory,probe_texture_id);}
+     else probe_frame=0;
+ }
+ static int graphics_probe_active(void) {graphics_probe_configure();return probe_frame&&!probe_done&&presents+1==probe_frame;}
+@@ -109,6 +112,7 @@ static void graphics_probe_shader(shader_entry *shader) {
+             // 显式一帧中额外读 FS slot35 非 BC 图的小区域，定位地面混合输入；不增加压缩材质预算。
+             // Add a small non-BC FS slot35 readback in the requested frame to inspect ground-blend inputs without increasing the compressed-material budget.
+             if(stage==1&&binding->kind==3&&slot==35){texture_descriptor descriptor=descriptor_texture(handle&0xfffff);if(descriptor.valid){const view_t *view=&descriptor.view;graphics_probe_interest(descriptor.texture.serial,view->set_levels?view->base_level:0,view->set_layers?view->min_layer:0);}}
++            if(stage==1&&binding->kind==3&&slot==0&&!strcmp(shader->key,"3a1e03d7ccd79566")){texture_descriptor descriptor=descriptor_texture(handle&0xfffff);if(descriptor.valid){const tex_t *texture=&descriptor.texture;const view_t *view=&descriptor.view;unsigned mip=view->set_levels?view->base_level:0,layer=view->set_layers?view->min_layer:0,id=handle&0xfffff;if((!probe_texture_id||id==probe_texture_id)&&mip<texture->d.levels&&layer<texture->L.layers){image_entry *image=graphics_probe_image(texture->serial);if(image&&image->aspect==VK_IMAGE_ASPECT_COLOR_BIT){probe_image *entry=probe_images;while(entry&&(entry->serial!=texture->serial||entry->mip!=mip||entry->layer!=layer))entry=entry->next;if(!entry){entry=calloc(1,sizeof *entry);if(!entry)die("Vulkan menu texture probe metadata");entry->serial=texture->serial;entry->mip=mip;entry->layer=layer;entry->next=probe_images;probe_images=entry;}entry->priority=3;entry->full=1;probe_texture_selected=1;uint64_t size=texture->L.size;if(texture->mem&&size&&size<=(8u<<20)){uint8_t *bytes=malloc(size);if(!bytes)die("Vulkan menu texture source allocation");if(!snapshot_read((uintptr_t)texture->mem,bytes,size)){char path[1200];snprintf(path,sizeof path,"%s/texture-source-%llu-full.bin",probe_directory,(unsigned long long)texture->serial);FILE *file=fopen(path,"wb");if(!file)die("Vulkan menu texture source open");fwrite(bytes,1,size,file);fclose(file);fprintf(probe_trace,"Y\\tmenu-texture-source\\tid=%u\\tserial=%llu\\tfmt=%#x\\tdim=%u,%u\\tstorage=%llu\\tfile=texture-source-%llu-full.bin\\n",id,(unsigned long long)texture->serial,texture->d.format,texture->d.width,texture->d.height,(unsigned long long)size,(unsigned long long)texture->serial);}free(bytes);}}}}}
+             // 已确认营地地形颜色/法线缓存：固定 world(8018,9858) 对应 atlas 约(998,998)，各取256²，不跟随移动角色。
+             // Confirmed camp terrain color/normal caches: fixed world(8018,9858) maps near atlas(998,998); capture 256-square regions without following the moving character.
+             if(stage==1&&binding->kind==3&&(slot==35||slot==36)&&!strcmp(shader->key,"e1c00b41f984949c")){texture_descriptor descriptor=descriptor_texture(handle&0xfffff);if(descriptor.valid&&descriptor.texture.d.format==NVN_FORMAT_RGBA8){const view_t *view=&descriptor.view;unsigned mip=view->set_levels?view->base_level:0,layer=view->set_layers?view->min_layer:0;graphics_probe_interest(descriptor.texture.serial,mip,layer);
+@@ -278,13 +282,13 @@ static void graphics_probe_capture(uint64_t frame) {
+         read->readback=buffer_create(bytes);VkBufferMemoryBarrier source={.sType=VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT,.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT,.srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.buffer=read->source.buffer,.offset=aligned,.size=bytes};
+         vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,NULL,1,&source,0,NULL);VkBufferCopy copy={.srcOffset=aligned,.size=bytes};vkCmdCopyBuffer(command,read->source.buffer,read->readback.buffer,1,&copy);}
+     unsigned bc_count=0;uint64_t bc_bytes=0;
+-    for(int priority=2;priority>=0;priority--)for(probe_image *interest=probe_images;interest;interest=interest->next){if(interest->priority!=(unsigned)priority)continue;image_entry *image=graphics_probe_image(interest->serial);if(!image)continue;unsigned level=interest->mip;uint32_t full_w=dimension(image->texture.d.width,level),full_h=dimension(image->texture.d.height,level),full_d=image->texture.d.target==NVN_TEXTURE_TARGET_3D?dimension(image->texture.d.depth,level):1;int bw,bh,bpb=nvn_fmt_bpb(image->texture.d.format,&bw,&bh),compressed=bw==4&&bh==4;
++    for(int priority=3;priority>=0;priority--)for(probe_image *interest=probe_images;interest;interest=interest->next){if(interest->priority!=(unsigned)priority)continue;image_entry *image=graphics_probe_image(interest->serial);if(!image)continue;unsigned level=interest->mip;uint32_t full_w=dimension(image->texture.d.width,level),full_h=dimension(image->texture.d.height,level),full_d=image->texture.d.target==NVN_TEXTURE_TARGET_3D?dimension(image->texture.d.depth,level):1;int bw,bh,bpb=nvn_fmt_bpb(image->texture.d.format,&bw,&bh),compressed=bw==4&&bh==4;
+         if(bpb<=0||bpb>16||(!compressed&&(bw!=1||bh!=1))||level>=image->texture.d.levels||interest->layer>=image->texture.L.layers||(compressed&&(!priority||bc_count>=24)))continue;
+         // Vulkan depth-plane copies use D16=2 / D24=4 / D32=4 bytes; combined stencil bytes are separate.
+         int depth=!!(image->aspect&VK_IMAGE_ASPECT_DEPTH_BIT);if(depth)bpb=image->texture.d.format==NVN_FORMAT_DEPTH16?2:4;
+         probe_read *read=calloc(1,sizeof *read);if(!read)die("Vulkan probe read allocation");read->serial=image->serial;read->texture=image->texture.d;read->mip=level;read->layer=interest->layer;
+-        unsigned maximum=compressed?(full_w<=1024&&full_h<=1024?1024:256):depth&&full_w<=2048&&full_h<=2048?2048:64;read->w=full_w<maximum?full_w:maximum;read->h=full_h<maximum?full_h:maximum;read->d=full_d<32?full_d:32;read->x=(full_w-read->w)/2;read->y=(full_h-read->h)/2;read->bpb=bpb;
+-        if(!compressed&&!depth&&interest->roi_w&&interest->roi_h){read->w=full_w<interest->roi_w?full_w:interest->roi_w;read->h=full_h<interest->roi_h?full_h:interest->roi_h;read->x=interest->roi_x>full_w-read->w?full_w-read->w:interest->roi_x;read->y=interest->roi_y>full_h-read->h?full_h-read->h:interest->roi_y;}
++        unsigned maximum=interest->full?full_w:(compressed?(full_w<=1024&&full_h<=1024?1024:256):depth&&full_w<=2048&&full_h<=2048?2048:64);read->w=full_w<maximum?full_w:maximum;read->h=interest->full?full_h:(full_h<maximum?full_h:maximum);read->d=full_d<32?full_d:32;read->x=interest->full?0:(full_w-read->w)/2;read->y=interest->full?0:(full_h-read->h)/2;read->bpb=bpb;
++        if(interest->full&&((uint64_t)read->w*read->h*read->d*bpb>(8u<<20)||compressed)){free(read);continue;}
+         read->bw=bw;read->bh=bh;if(compressed){read->x=read->x/bw*bw;read->y=read->y/bh*bh;}uint64_t bytes=(uint64_t)((read->w+bw-1)/bw)*((read->h+bh-1)/bh)*read->d*bpb;
+         if(compressed){if(bc_bytes+bytes>(8u<<20)){free(read);continue;}bc_bytes+=bytes;bc_count++;graphics_probe_material_source(image);}read->buffer=buffer_create(bytes);
+         image_access(image,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);VkBufferImageCopy copy={.imageSubresource={depth?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT,level,read->layer,1},.imageOffset={(int)read->x,(int)read->y,0},.imageExtent={read->w,read->h,read->d}};
 diff --git a/dm/android/native/nvn_vulkan_shader.inc b/dm/android/native/nvn_vulkan_shader.inc
 index 008169d..6e53aac 100644
 --- a/dm/android/native/nvn_vulkan_shader.inc
@@ -35,6 +1715,900 @@ index 008169d..6e53aac 100644
  }
  static void program_remove(const prog_t *program) {
      unsigned bucket=((uintptr_t)program>>4)&1023;resolved_program **link=&program_index[bucket];while(*link&&(*link)->program!=program)link=&(*link)->next;
+diff --git a/dm/android/native/nvn_vulkan_tex.inc b/dm/android/native/nvn_vulkan_tex.inc
+index ea5a08b..80f1316 100644
+--- a/dm/android/native/nvn_vulkan_tex.inc
++++ b/dm/android/native/nvn_vulkan_tex.inc
+@@ -292,8 +292,16 @@ void mtl_read_texels(const tex_t *t,unsigned level,unsigned layer,const NVNcopyR
+     VkMemoryBarrier barrier={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT,.dstAccessMask=VK_ACCESS_HOST_READ_BIT};vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,NULL,0,NULL);uint64_t ticket=mtl_sub_commit();mtl_wait(ticket,UINT64_MAX);
+     // 真正 GPU 等待已结束后才持宿主写 guard，不能把 shared 锁带进 queue 等待。
+     // Acquire the host-write guard only after the real GPU wait; never carry its shared lock into a queue wait.
+-    if(!row)row=pitch;if(!img)img=row*rows;int guarded=dm_guest_host_write_begin&&dm_guest_host_write_end;
++    if(!row)row=pitch;if(!img)img=row*rows;
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++    dm_guest_write_prepare(dst,img*r->depth);
++#else
++    int guarded=dm_guest_host_write_begin&&dm_guest_host_write_end;
+     if(guarded)dm_guest_host_write_begin(dst,img*r->depth);else dm_guest_write_prepare(dst,img*r->depth);
++#endif
+     for(unsigned z=0;z<(unsigned)r->depth;z++)for(unsigned y=0;y<rows;y++)memcpy(dst+z*img+y*row,(uint8_t*)readback.mapped+(z*rows+y)*pitch,pitch);
+-    if(guarded)dm_guest_host_write_end();buffer_destroy(&readback);
++#ifndef TOUCHABLE_SWITCH_RUNTIME
++    if(guarded)dm_guest_host_write_end();
++#endif
++    buffer_destroy(&readback);
+ }
+diff --git a/dm/android/tools/build.py b/dm/android/tools/build.py
+index 931414e..ff8dee7 100644
+--- a/dm/android/tools/build.py
++++ b/dm/android/tools/build.py
+@@ -3,7 +3,9 @@
+ Build a standalone ARM64 NativeActivity APK and runtime tests without Gradle.
+ """
+ import argparse
++import hashlib
+ import importlib.util
++import json
+ import os
+ from pathlib import Path
+ import re
+@@ -17,6 +19,94 @@ ROOT = Path(__file__).resolve().parents[1]
+ TOOLS = Path(os.environ.get("DM_ANDROID_TOOLS", str(Path.home() / "dm-work/tools/android")))
+ BIN = TOOLS / "ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+ 
++# Android APK tooling requires classic ZIP offsets, not ZIP64. Python defaults to
++# a conservative 2 GiB threshold; every APK/entry/offset is checked below 4 GiB.
++ZIP32_LIMIT = (1 << 32) - 1
++zipfile.ZIP64_LIMIT = ZIP32_LIMIT
++STANDALONE_CHUNK_BYTES = 512 << 20
++
++
++def check_apk_size(path, signing_reserve=0):
++    if path.stat().st_size + signing_reserve >= ZIP32_LIMIT:
++        sys.exit("APK exceeds the classic ZIP 4 GiB boundary: " + str(path))
++    with zipfile.ZipFile(path) as archive:
++        if len(archive.infolist()) >= 65535 or archive.start_dir >= ZIP32_LIMIT:
++            sys.exit("APK requires ZIP64 (entry count or central-directory offset)")
++        for item in archive.infolist():
++            if max(item.file_size, item.compress_size, item.header_offset) >= ZIP32_LIMIT or item.extract_version >= 45:
++                sys.exit("APK entry requires ZIP64: " + item.filename)
++
++
++def build_standalone_payload(args, modules, build, assets):
++    """A compressed ZIP, physically chunked for bounded Android asset streams.
++
++    Reuses PackageArchive's complete import contract, including executable modules
++    on internal storage and the completion manifest written only after acceptance.
++    No game or save file is modified; all packaging reads are streaming.
++    """
++    roots = {"romfs": args.romfs, "shaders": args.shader_cache}
++    entries = []
++    counts, sizes = {}, {}
++    for kind, root in roots.items():
++        paths = sorted(path for path in root.rglob("*") if path.is_file())
++        if not paths: sys.exit("Standalone payload directory is empty: " + str(root))
++        for path in paths:
++            if path.is_symlink(): sys.exit("Standalone payload must not contain symlinks: " + str(path))
++            entries.append((path, kind + "/" + path.relative_to(root).as_posix()))
++        counts[kind] = len(paths)
++        sizes[kind] = sum(path.stat().st_size for path in paths)
++    for module in modules:
++        for name in ("libdmguest_" + module + ".so", module + ".fixups.tsv", module + ".gates.tsv"):
++            source = args.game_source / name
++            if not source.is_file(): sys.exit("Standalone module file is missing: " + str(source))
++            entries.append((source, "game/" + name))
++    counts["game"] = len(modules) * 3
++    counts["touch"] = 0
++    sizes["game"] = sum(path.stat().st_size for path, name in entries if name.startswith("game/"))
++    if len(entries) + 1 >= 65535: sys.exit("Standalone archive has too many entries for classic ZIP")
++    payload_dir = build / "standalone-assets"
++    shutil.rmtree(payload_dir, ignore_errors=True)
++    payload_dir.mkdir()
++    payload = payload_dir / "payload.zip.tmp"
++    manifest = {"format": 1, "counts": counts, "bytes": sizes, "standalone": True}
++    with zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=False) as archive:
++        buffer_size = 1 << 20
++        for source, name in entries:
++            info = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
++            info.compress_type = zipfile.ZIP_DEFLATED
++            info.external_attr = 0o644 << 16
++            info.file_size = source.stat().st_size
++            if info.file_size >= ZIP32_LIMIT: sys.exit("Standalone file exceeds ZIP32: " + str(source))
++            with source.open("rb") as raw, archive.open(info, "w") as target:
++                shutil.copyfileobj(raw, target, buffer_size)
++        archive.writestr("manifest.json", json.dumps(manifest, sort_keys=True) + "\n")
++    check_apk_size(payload)
++    digest = hashlib.sha256()
++    parts = []
++    with payload.open("rb") as raw:
++        while True:
++            first = raw.read(1 << 20)
++            if not first: break
++            part = payload_dir / ("payload-%03d.bin" % len(parts))
++            with part.open("wb") as target:
++                block, written = first, 0
++                while block:
++                    target.write(block)
++                    digest.update(block)
++                    written += len(block)
++                    if written == STANDALONE_CHUNK_BYTES: break
++                    block = raw.read(min(1 << 20, STANDALONE_CHUNK_BYTES - written))
++            parts.append(part)
++    compressed = payload.stat().st_size
++    payload.unlink()
++    descriptor = {"format": 1, "id": digest.hexdigest(), "parts": ["standalone/" + part.name for part in parts],
++                  "unpacked_bytes": sum(sizes.values()), "compressed_bytes": compressed,
++                  "external_bytes": sizes["romfs"] + sizes["shaders"], "internal_bytes": sizes["game"], "counts": counts}
++    (assets / "standalone.json").write_text(json.dumps(descriptor, sort_keys=True) + "\n")
++    print("Standalone: %d RomFS files (%d bytes), %d shader files; %d compressed bytes in %d assets" %
++          (counts["romfs"], sizes["romfs"], counts["shaders"], compressed, len(parts)), flush=True)
++    return parts
++
+ GAME_ACTIVITY = "org.d2r.android.port.D2RActivity"
+ LAUNCHER_NAME = "org.d2r.android.port.LauncherActivity"
+ # 正式构建把仓库清单里的单个 NativeActivity 换成这两条：启动界面当入口，游戏本体降级成它启动的第二个页面。
+@@ -205,7 +295,12 @@ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--install", action="store_true")
+     parser.add_argument("--game-source", type=Path, help="Local rewritten Android game modules (includes game code in APK)")
++    parser.add_argument("--standalone", action="store_true", help="Bundle complete game data and prepare it automatically; requires --game-source and --romfs")
++    parser.add_argument("--romfs", type=Path, help="Full active RomFS directory for --standalone (all files, no filtering)")
+     parser.add_argument("--game-run", action="store_true", help="Run the real game host with NVN/Vulkan instead of the diagnostic frontend")
++    parser.add_argument("--sources-json", type=Path, help="Host compile-unit manifest")
++    parser.add_argument("--host-out", type=Path, help="Host object and library directory")
++    parser.add_argument("--output-apk", type=Path, default=None, help="Signed APK output path")
+     parser.add_argument("--shader-cache", type=Path, default=Path.home() / "dm-work/build/android/shaders/spirv")
+     parser.add_argument("--version", default="dev",
+                         help="写进 APK 的版本：发布用 tag 名（v0.3），分支构建用 main-<短提交>；默认 dev")
+@@ -222,8 +317,23 @@ def main():
+                         help="Test builds only (requires --game-run): compile the Vulkan WSI fault injection driven by the "
+                              "debug.d2r.wsi_fault system property; never use for a release")
+     args = parser.parse_args()
++    host_manifest = json.loads(args.sources_json.read_text()) if args.sources_json else None
++    modules = host_manifest["game"]["module_names"] if host_manifest else ["main", "sdk", "subsdk0"]
+     if args.game_source and not args.game_run: parser.error("--game-source only makes sense with --game-run")
+     if args.wsi_fault_injection and not args.game_run: parser.error("--wsi-fault-injection only makes sense with --game-run")
++    if args.standalone:
++        if not args.game_run or not args.game_source or not host_manifest:
++            parser.error("--standalone requires --game-run, --game-source and --sources-json")
++        if args.romfs is None or not args.romfs.is_dir(): parser.error("--standalone requires an existing --romfs directory")
++        if args.no_turnip or not args.turnip.is_file(): parser.error("--standalone requires the bundled Turnip driver")
++        profile = args.shader_cache / "host-profile.json"
++        subgroup = args.shader_cache / "host-subgroup-size.txt"
++        if not profile.is_file() or not subgroup.is_file(): parser.error("--standalone requires a complete shader cache/profile")
++        if (args.shader_cache / "driver-variants.failed").exists(): parser.error("--standalone shader cache is marked incomplete")
++        if subgroup.read_text().strip() != "64" or json.loads(profile.read_text()).get("host_subgroup_size") != 64:
++            parser.error("--standalone requires the supported Turnip subgroup64 shader cache")
++    elif args.romfs is not None:
++        parser.error("--romfs only makes sense with --standalone")
+     # 包名 / 标签只改可玩 APK 的清单；没有 --game-run 时会被默默忽略，所以直接报错（审查第 1 轮 Opus M5）。
+     # The package name / label only change the playable APK's manifest; without --game-run they would be silently
+     # ignored, so fail instead (review round 1 Opus M5).
+@@ -255,11 +365,9 @@ def main():
+         print("Package-only build: game modules come from the imported package", flush=True)
+     build = ROOT / "build"
+     build.mkdir(exist_ok=True)
+-    # 先删旧包：这次构建中途失败时，不能留下上一次的 APK 被当成这一次的产物拿走。
+-    # Remove the previous package first, so a build that fails part-way cannot leave the last build's APK behind to
+-    # be taken for this one.
+-    apk = build / "D2R-Android-port.apk"
+-    apk.unlink(missing_ok=True)
++    apk = args.output_apk.resolve() if args.output_apk else build / "D2R-Android-port.apk"
++    apk.parent.mkdir(parents=True, exist_ok=True)
++    if not args.output_apk: apk.unlink(missing_ok=True)
+     if args.game_run: build_counter_timestamp(build)
+     for required in [BIN / "aarch64-linux-android29-clang", TOOLS / "jdk/bin/java", TOOLS / "platform/android.jar"]:
+         if not required.exists(): sys.exit("Missing tool: " + str(required) + "; run tools/bootstrap.py")
+@@ -303,8 +411,13 @@ def main():
+     common = [compiler, "-O1", "-g", "-Wall", "-Wextra", "-I", ROOT / "native", "-I", build, "-I", build / "gpu-driver/include", ROOT / "native/runtime.c", ROOT / "native/probe.c", entry]
+     run(common + ["-ldl", "-o", build / "runtime-smoke"])
+     if args.game_run:
+-        run([sys.executable, ROOT / "tools/host_link.py", "--activity"] + (["--wsi-fault-injection"] if args.wsi_fault_injection else []))
+-        shutil.copyfile(build / "game-host/libdmandroid.so", build / "libdmandroid.so")
++        host_command = [sys.executable, ROOT / "tools/host_link.py", "--activity"]
++        if args.sources_json: host_command += ["--sources-json", args.sources_json.resolve()]
++        if args.host_out: host_command += ["--out", args.host_out.resolve()]
++        if args.wsi_fault_injection: host_command.append("--wsi-fault-injection")
++        run(host_command)
++        host_out = args.host_out.resolve() if args.host_out else build / "game-host"
++        shutil.copyfile(host_out / "libdmandroid.so", build / "libdmandroid.so")
+     else:
+         run(common + ["-fPIC", "-shared", "-DDM_NATIVE_APP", "-Wl,-z,max-page-size=16384", "-Wl,-z,defs",
+                   ROOT / "native/activity.c", ROOT / "native/app_probe.c", ROOT / "native/vulkan_front.c",
+@@ -317,6 +430,9 @@ def main():
+     assets = build / "assets"
+     shutil.rmtree(assets, ignore_errors=True)
+     assets.mkdir()
++    if args.sources_json:
++        host_manifest = json.loads(args.sources_json.read_text())
++        (assets / "touchable_game.json").write_text(json.dumps(host_manifest["game"]) + "\n")
+     licenses = assets / "licenses"
+     licenses.mkdir(exist_ok=True)
+     for license_file in (build / "gpu-driver/licenses").glob("*.txt"):
+@@ -367,13 +483,14 @@ def main():
+     for name in ["probe.fixups.tsv", "probe.gates.tsv"]:
+         shutil.copyfile(build / "probe" / name, assets / name)
+     if args.game_source:
+-        run([sys.executable, ROOT / "tools/guest_elf.py", args.game_source, args.game_source, "main", "sdk", "subsdk0"])
+-        for name in ["main", "sdk", "subsdk0"]:
++        run([sys.executable, ROOT / "tools/guest_elf.py", args.game_source, args.game_source, *modules])
++        for name in modules:
+             shutil.copyfile(args.game_source / (name + ".fixups.tsv"), assets / (name + ".fixups.tsv"))
+             if args.game_run: shutil.copyfile(args.game_source / (name + ".gates.tsv"), assets / (name + ".gates.tsv"))
+     else:
+-        for name in ["main", "sdk", "subsdk0"]:
++        for name in modules:
+             (assets / (name + ".fixups.tsv")).unlink(missing_ok=True)
++    standalone_parts = build_standalone_payload(args, modules, build, assets) if args.standalone else []
+     unsigned = build / "unsigned.apk"
+     activity = "android.app.NativeActivity"
+     manifest = ROOT / "AndroidManifest.xml"
+@@ -432,7 +549,9 @@ def main():
+     run([TOOLS / "build-tools/aapt2", "compile", "--dir", build / "res", "-o", build / "resources.zip"])
+     run([TOOLS / "build-tools/aapt2", "link", "--manifest", manifest,
+          "-I", TOOLS / "platform/android.jar", "-A", assets, "-o", unsigned, build / "resources.zip"])
+-    with zipfile.ZipFile(unsigned, "a", compression=zipfile.ZIP_STORED) as z:
++    with zipfile.ZipFile(unsigned, "a", compression=zipfile.ZIP_STORED, allowZip64=False) as z:
++        for part in standalone_parts:
++            z.write(part, "assets/standalone/" + part.name)
+         if args.game_run: z.write(dex / "classes.dex", "classes.dex")
+         z.write(build / "libdmandroid.so", "lib/arm64-v8a/libdmandroid.so")
+         z.write(build / "probe/libdmguest_probe.so", "lib/arm64-v8a/libdmguest_probe.so")
+@@ -441,10 +560,12 @@ def main():
+         for fixture in sorted((build / "gpu-fixtures").glob("*.so")):
+             z.write(fixture,"lib/arm64-v8a/" + fixture.name)
+         if args.game_source:
+-            for name in ["main", "sdk", "subsdk0"]:
++            for name in modules:
+                 z.write(args.game_source / ("libdmguest_" + name + ".so"), "lib/arm64-v8a/libdmguest_" + name + ".so")
++    check_apk_size(unsigned, signing_reserve=16 << 20)
+     aligned = build / "aligned.apk"
+     run([TOOLS / "build-tools/zipalign", "-f", "-P", "16", "4", unsigned, aligned])
++    check_apk_size(aligned, signing_reserve=16 << 20)
+     # 先签到临时文件，验签与清单核对都过了才改名成最终 APK：核对失败时最终路径上不会有一个看似成功的包。
+     # Sign into a temporary file and rename it to the final APK only after the signature and manifest checks pass, so
+     # a failed check never leaves a package that looks good at the final path.
+@@ -476,6 +597,7 @@ def main():
+     try:
+         run([TOOLS / "build-tools/apksigner", "verify", signed], env=env)
+         if args.game_run: verify_game_manifest(signed, release=signing is not None)
++        check_apk_size(signed)
+     except BaseException:
+         # 核对没过的已签名包不留在构建目录里。| A signed package that failed the checks is not left in the build directory.
+         signed.unlink(missing_ok=True)
+@@ -488,7 +610,7 @@ def main():
+         # launch target, org.d2r.android.port).
+         package = args.package_name if args.game_run and args.package_name is not None else "org.d2r.android.port"
+         run([TOOLS / "platform-tools/adb", "install", "-r", apk])
+-        if args.game_run:
++        if args.game_run and not args.standalone:
+             if not args.shader_cache.is_dir(): sys.exit("Missing shader cache: " + str(args.shader_cache))
+             run([TOOLS / "platform-tools/adb", "shell", "mkdir", "-p", "/sdcard/Android/data/" + package + "/files/shaders"])
+             run([TOOLS / "platform-tools/adb", "push", "--sync", str(args.shader_cache) + "/.", "/sdcard/Android/data/" + package + "/files/shaders/"])
+diff --git a/dm/android/tools/host_link.py b/dm/android/tools/host_link.py
+index 8f18219..d5555c3 100644
+--- a/dm/android/tools/host_link.py
++++ b/dm/android/tools/host_link.py
+@@ -23,9 +23,11 @@ def compile(item):
+     command = [str(CLANG), "-c", "-fPIC", "-O3", "-fno-strict-aliasing", "-fno-omit-frame-pointer", "-g", "-MMD", "-MF", str(deps), "-D_GNU_SOURCE", "-I", str(ROOT / "host"),
+                "-I", str(ROOT / "android/native"), "-I", str(ROOT / "gfx/nvn/include"), "-I", str(ROOT / "android/native/compat"), "-I", str(ROOT / "android/build/gpu-driver/include"),
+                "-I", str(OUT)]
+-    if source.parent == ROOT / "host" or source.parent == ROOT / "gfx/nvn": command += ["-include", str(ROOT / "android/native/compat/host_preinclude.h")]
++    darwin_shims = source.parent in (ROOT / "host", ROOT / "gfx/nvn") or "-fdm-darwin-shims" in extra
++    if darwin_shims:
++        command += ["-include", str(ROOT / "android/native/compat/host_preinclude.h")]
+     if source.name == "main.c": command += ["-Dmain=dm_main"]
+-    command += extra + [str(source), "-o", str(obj)]
++    command += [arg for arg in extra if arg != "-fdm-darwin-shims"] + [str(source), "-o", str(obj)]
+     recorded = repr(command)
+     if obj.exists() and deps.exists() and stamp.exists() and stamp.read_text() == recorded:
+         dependencies = shlex.split(deps.read_text().split(":", 1)[1].replace("\\\n", " "))
+@@ -40,42 +42,58 @@ def compile(item):
+ if __name__ == "__main__":
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--activity", action="store_true", help="Build the real-game NativeActivity shared library")
++    parser.add_argument("--out", metavar="DIR", help="Use this build directory instead of android/build/host or android/build/game-host")
++    parser.add_argument("--sources-json", metavar="PATH", help="Replace the built-in source list with a JSON manifest: "
++                        '{"compile_units":[{"source":"...","extra":["..."]},...],"include_dirs":[...],"defines":[...],"link_flags":[...]}')
+     parser.add_argument("--wsi-fault-injection", action="store_true",
+                         help="Test builds only: compile the Vulkan WSI fault injection (debug.d2r.wsi_fault) into nvn_vulkan.c")
+     args = parser.parse_args()
+-    if args.activity: OUT = ROOT / "android/build/game-host"
++    if args.out: OUT = Path(args.out).resolve()
++    elif args.activity: OUT = ROOT / "android/build/game-host"
+     OUT.mkdir(parents=True, exist_ok=True)
+     subprocess.run([sys.executable,str(ROOT / "android/tools/build_gpu_driver.py")],check=True)
+     entry = OUT / "entry_elf.S"
+     subprocess.run([sys.executable, str(ROOT / "android/tools/generate_entry.py"), str(entry)], check=True)
+     subprocess.run([sys.executable, str(ROOT / "android/tools/generate_nvn.py"), str(OUT)], check=True)
+-    # 触屏图集表头（几何与条数，来自仓库里冻结的 manifest；技能索引的行在运行时从触屏包读）。
+-    # Touch atlas header (geometry and row count from the frozen manifest in the repository; the skill-index rows are
+-    # read from the touch pack at run time).
+-    subprocess.run([sys.executable, str(ROOT / "android/tools/gen_touch_art.py"), str(OUT / "touch_art_tab.h")], check=True)
+-    sources = [(p, []) for p in sorted((ROOT / "host").glob("*.c"))]
+-    sources += [(ROOT / "android/native" / name, []) for name in ["runtime.c", "host_posix.c", "host_tls.c", "host_sections.c", "legacy_digest.c", "pending_ranges.c", "performance_hint.c", "launch_settings.c", "posture.c", "frontend_activity.c" if args.activity else "frontend_headless.c", "gpu_driver.c", "present_rect.c"]]
+-    if args.activity: sources += [(ROOT / "android/native/controller.c", [])]   # 实体手柄（WP5）| physical controllers (WP5)
+-    # 故障注入只编进测试构建（正式构建的 nvn_vulkan.c 没有这段代码）。| Fault injection only in test builds (release nvn_vulkan.c has no such code).
+-    sources += [(ROOT / "android/native/nvn_vulkan.c", ["-DDM_WSI_FAULT_INJECTION"] if args.wsi_fault_injection else [])]
+-    sources += [(ROOT / "ios/Sources/dm_touch_controls.c", []), (entry, [])]
+-    if args.activity:
+-        # 上游 iOS 触屏方案：C 状态机（上面）+ 技能绑定读取（三份 iOS 共用 C）+ Android 前端接线与图集索引。
+-        # The upstream iOS touch scheme: the C state machine (above) + the skill-binding reader (three shared iOS C
+-        # files) + the Android front-end wiring and atlas index.
+-        sources += [(ROOT / "ios/Sources" / name, []) for name in ["dm_touch_game_bridge.c", "dm_touch_game_state.c", "dm_touch_game_identity.c"]]
+-        sources += [(ROOT / "android/native" / name, []) for name in ["touch_front.c", "touch_art.c", "fold_layout.c", "fold_state.c"]]
+-    sources += [(ROOT / "gfx" / name, []) for name in ["hle_nv.c", "hle_vi.c"]]
+-    sources += [(ROOT / "gfx/nvn" / name, []) for name in ["hle_nvn.c", "nvn_tex.c", "nvn_dirty.c"]]
+-    sources += [(ROOT / "gfx/tex/nvn_deswizzle.c", [])]
+-    sources += [(OUT / (name + "_elf.S"), []) for name in ["nvn_thunks", "nvn_entry"]]
+-    third = ROOT / "third_party/libdeflate/lib"
+-    sources += [(third / name, []) for name in ["deflate_decompress.c", "zlib_decompress.c", "adler32.c", "utils.c", "arm/cpu_features.c"]]
++    if args.sources_json:
++        import json
++        manifest = json.loads(Path(args.sources_json).read_text())
++        # 外部清单：编译单元、包含目录、宏与链接旗标由调用方给出（Touchable 的按游戏宿主）。
++        # External manifest: compile units, include dirs, defines and link flags come from the caller (the per-game Touchable host).
++        sources = [(Path(unit["source"]), (["-fdm-darwin-shims"] if unit.get("darwin_shims") else [])
++                    + list(unit.get("extra", []))
++                    + [flag for inc in manifest.get("include_dirs", []) for flag in ("-I", inc)]
++                    + ["-D" + name for name in manifest.get("defines", [])]) for unit in manifest["compile_units"]]
++        link_extra = list(manifest.get("link_flags", []))
++    else:
++        # 触屏图集表头（几何与条数，来自仓库里冻结的 manifest；技能索引的行在运行时从触屏包读）。
++        # Touch atlas header (geometry and row count from the frozen manifest in the repository; the skill-index rows are
++        # read from the touch pack at run time).
++        subprocess.run([sys.executable, str(ROOT / "android/tools/gen_touch_art.py"), str(OUT / "touch_art_tab.h")], check=True)
++        sources = [(p, []) for p in sorted((ROOT / "host").glob("*.c"))]
++        sources += [(ROOT / "android/native" / name, []) for name in ["runtime.c", "host_posix.c", "host_tls.c", "host_sections.c", "legacy_digest.c", "pending_ranges.c", "performance_hint.c", "launch_settings.c", "posture.c", "frontend_activity.c" if args.activity else "frontend_headless.c", "gpu_driver.c", "present_rect.c"]]
++        if args.activity: sources += [(ROOT / "android/native/controller.c", [])]   # 实体手柄（WP5）| physical controllers (WP5)
++        # 故障注入只编进测试构建（正式构建的 nvn_vulkan.c 没有这段代码）。| Fault injection only in test builds (release nvn_vulkan.c has no such code).
++        sources += [(ROOT / "android/native/nvn_vulkan.c", ["-DDM_WSI_FAULT_INJECTION"] if args.wsi_fault_injection else [])]
++        sources += [(ROOT / "ios/Sources/dm_touch_controls.c", []), (entry, [])]
++        if args.activity:
++            # 上游 iOS 触屏方案：C 状态机（上面）+ 技能绑定读取（三份 iOS 共用 C）+ Android 前端接线与图集索引。
++            # The upstream iOS touch scheme: the C state machine (above) + the skill-binding reader (three shared iOS C
++            # files) + the Android front-end wiring and atlas index.
++            sources += [(ROOT / "ios/Sources" / name, []) for name in ["dm_touch_game_bridge.c", "dm_touch_game_state.c", "dm_touch_game_identity.c"]]
++            sources += [(ROOT / "android/native" / name, []) for name in ["touch_front.c", "touch_art.c", "fold_layout.c", "fold_state.c"]]
++        sources += [(ROOT / "gfx" / name, []) for name in ["hle_nv.c", "hle_vi.c"]]
++        sources += [(ROOT / "gfx/nvn" / name, []) for name in ["hle_nvn.c", "nvn_tex.c", "nvn_dirty.c"]]
++        sources += [(ROOT / "gfx/tex/nvn_deswizzle.c", [])]
++        sources += [(OUT / (name + "_elf.S"), []) for name in ["nvn_thunks", "nvn_entry"]]
++        third = ROOT / "third_party/libdeflate/lib"
++        sources += [(third / name, []) for name in ["deflate_decompress.c", "zlib_decompress.c", "adler32.c", "utils.c", "arm/cpu_features.c"]]
++        link_extra = []
+     with ThreadPoolExecutor(max_workers=4) as pool: objects = list(pool.map(compile, sources))
+     if any(obj is None for obj in objects): sys.exit(1)
+     output = OUT / ("libdmandroid.so" if args.activity else "dmhost-android")
+     link_flags = ["-shared", "-Wl,-z,defs"] if args.activity else []
+-    result = subprocess.run([str(CLANG), "-Wl,-z,max-page-size=16384", *map(str, objects), *link_flags, "-landroid", "-llog", "-laaudio", "-ldl", "-lm", "-o", str(output)], capture_output=True, text=True)
++    result = subprocess.run([str(CLANG), "-Wl,-z,max-page-size=16384", *map(str, objects), *link_flags, *link_extra, "-landroid", "-llog", "-laaudio", "-ldl", "-lm", "-o", str(output)], capture_output=True, text=True)
+     (OUT / "link.log").write_text(result.stdout + result.stderr)
+     if result.returncode:
+         print("Link failed; see", OUT / "link.log", "\n" + result.stderr[:6000]); sys.exit(1)
+diff --git a/dm/gfx/nvn/hle_nvn.c b/dm/gfx/nvn/hle_nvn.c
+index 0127f2e..37b0bc3 100644
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -179,6 +179,11 @@ NVN(nvnDeviceGetInteger, void, const NVNdevice *d, NVNdeviceInfo what, int *out)
+     OLOG("DeviceGetInteger %#x -> %d", w, *out);
+ }
+ NVN(nvnDeviceGetImageHandle, NVNimageHandle, const NVNdevice *d, int id) { (void)d; return (NVNimageHandle)id; }
++NVN(nvnDeviceGetTextureHandle, NVNtextureHandle, const NVNdevice *d, int texture, int sampler) {
++    (void)d;
++    if (texture < 0 || texture >= (1 << 20) || sampler < 0) die("Invalid texture handle request: %d, %d", texture, sampler);
++    return (NVNtextureHandle)texture | (NVNtextureHandle)sampler << 20;
++}
+ // 分离贴图 / 采样器句柄：值 = 描述符号（采样器号放 20 位以上，与组合句柄的位布局一致）
+ // Separate texture / sampler handles: value = descriptor index (the sampler index goes in bit 20 and above, consistent with the bit layout of combined handles)
+ NVN(nvnDeviceGetSeparateTextureHandle, NVNseparateTextureHandle, const NVNdevice *d, int id) { (void)d; return (NVNseparateTextureHandle){(uint64_t)id}; }
+@@ -221,6 +226,50 @@ NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
+ NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
+ NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { return (NVNbufferAddress)((const pool_t *)p)->mem; }
+ 
++NVN(nvnMemoryPoolGetFlags, NVNmemoryPoolFlags, const NVNmemoryPool *p) { return ((const pool_t *)p)->flags; }
++NVN(nvnMemoryPoolGetSize, size_t, const NVNmemoryPool *p) { return ((const pool_t *)p)->size; }
++NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p) { return ((const pool_t *)p)->mem; }
++
++typedef struct { NVNdevice *device; pool_t *pool; ptrdiff_t offset; size_t size; } buffer_builder_t;
++typedef struct { pool_t *pool; ptrdiff_t offset; size_t size; uint64_t serial; } buffer_t;
++FITS(buffer_builder_t, NVNbufferBuilder);
++FITS(buffer_t, NVNbuffer);
++NVN(nvnBufferBuilderSetDefaults, void, NVNbufferBuilder *builder) {
++    buffer_builder_t *b = (void *)builder;
++    b->pool = NULL; b->offset = 0; b->size = 0;
++}
++NVN(nvnBufferBuilderSetDevice, void, NVNbufferBuilder *builder, NVNdevice *device) { ((buffer_builder_t *)builder)->device = device; }
++NVN(nvnBufferBuilderSetStorage, void, NVNbufferBuilder *builder, NVNmemoryPool *pool, ptrdiff_t offset, size_t size) {
++    buffer_builder_t *b = (void *)builder; b->pool = (pool_t *)pool; b->offset = offset; b->size = size;
++}
++NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *buffer, const NVNbufferBuilder *builder) {
++    const buffer_builder_t *b = (const void *)builder;
++    if (!b->pool || b->offset < 0 || (uint64_t)b->offset > b->pool->size || b->size > b->pool->size - b->offset) return 0;
++    *(buffer_t *)buffer = (buffer_t){b->pool, b->offset, b->size, nvn_new_serial()};
++    return 1;
++}
++NVN(nvnBufferFinalize, void, NVNbuffer *buffer) { memset(buffer, 0, sizeof(buffer_t)); }
++NVN(nvnBufferMap, void *, const NVNbuffer *buffer) {
++    const buffer_t *b = (const void *)buffer;
++    return b->pool->mem + b->offset;
++}
++NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *buffer) { return (uintptr_t)h_nvnBufferMap(buffer); }
++NVN(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *buffer) { return (NVNmemoryPool *)((const buffer_t *)buffer)->pool; }
++NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *buffer) { return ((const buffer_t *)buffer)->offset; }
++NVN(nvnBufferGetSize, size_t, const NVNbuffer *buffer) { return ((const buffer_t *)buffer)->size; }
++NVN(nvnBufferGetDebugID, uint64_t, const NVNbuffer *buffer) { return ((const buffer_t *)buffer)->serial; }
++NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *buffer, ptrdiff_t offset, size_t size) {
++    const buffer_t *b = (const void *)buffer;
++    if (offset < 0 || (uint64_t)offset > b->size || size > b->size - offset) die("Buffer flush range is invalid");
++    h_nvnMemoryPoolFlushMappedRange((const NVNmemoryPool *)b->pool, b->offset + offset, size);
++}
++NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *buffer, ptrdiff_t offset, size_t size) {
++    const buffer_t *b = (const void *)buffer;
++    if (offset < 0 || (uint64_t)offset > b->size || size > b->size - offset) die("Buffer invalidate range is invalid");
++    atomic_thread_fence(memory_order_seq_cst);
++}
++
++
+ // ---------- 描述符池 ----------
+ // ---------- Descriptor pools ----------
+ NVN(nvnTexturePoolInitialize, NVNboolean, NVNtexturePool *tp, const NVNmemoryPool *p, ptrdiff_t off, int n) {
+@@ -378,6 +427,7 @@ NVN(nvnTextureGetFlags, NVNtextureFlags, const NVNtexture *t) { return (NVNtextu
+ NVN(nvnTextureGetWidth, int, const NVNtexture *t) { return (int)CTX(t)->d.width; }
+ NVN(nvnTextureGetHeight, int, const NVNtexture *t) { return (int)CTX(t)->d.height; }
+ NVN(nvnTextureGetDepth, int, const NVNtexture *t) { return (int)CTX(t)->d.depth; }
++NVN(nvnTextureGetTarget, NVNtextureTarget, const NVNtexture *t) { return (NVNtextureTarget)CTX(t)->d.target; }
+ NVN(nvnTextureGetStorageSize, int, const NVNtexture *t) { return (int)CTX(t)->L.size; }
+ NVN(nvnTextureCompare, NVNboolean, const NVNtexture *a, const NVNtexture *b) {
+     const tex_t *x = CTX(a), *y = CTX(b);
+@@ -395,6 +445,12 @@ NVN(nvnTextureViewSetTarget, void, NVNtextureView *v, NVNtextureTarget t) { VW(v
+ NVN(nvnTextureViewGetLayers, NVNboolean, const NVNtextureView *v, int *min, int *n) {
+     const view_t *o = (const view_t *)v; *min = o->min_layer; *n = o->nlayers; return o->set_layers;
+ }
++NVN(nvnTextureViewGetLevels, NVNboolean, const NVNtextureView *v, int *base, int *n) {
++    const view_t *o = (const view_t *)v; *base = o->base_level; *n = o->nlevels; return o->set_levels;
++}
++NVN(nvnTextureViewGetTarget, NVNboolean, const NVNtextureView *v, NVNtextureTarget *target) {
++    const view_t *o = (const view_t *)v; *target = (NVNtextureTarget)o->target; return o->set_target;
++}
+ NVN(nvnTextureGetViewOffset, ptrdiff_t, const NVNtexture *t, const NVNtextureView *v) {
+     const tex_t *o = CTX(t); const view_t *w = (const view_t *)v;
+     if (!w) return 0;
+@@ -439,6 +495,10 @@ NVN(nvnSamplerBuilderSetLodBias, void, NVNsamplerBuilder *b, float v) { SB(b)->l
+ NVN(nvnSamplerBuilderSetCompare, void, NVNsamplerBuilder *b, NVNcompareMode m, NVNcompareFunc f) { SB(b)->cmp_mode = m; SB(b)->cmp_func = f; }
+ NVN(nvnSamplerBuilderSetBorderColor, void, NVNsamplerBuilder *b, const float *c) { memcpy(SB(b)->border, c, 16); }
+ NVN(nvnSamplerBuilderSetMaxAnisotropy, void, NVNsamplerBuilder *b, float v) { SB(b)->aniso = v; }
++NVN(nvnSamplerBuilderSetReductionFilter, void, NVNsamplerBuilder *b, NVNsamplerReduction filter) {
++    (void)b;
++    if (filter != NVN_SAMPLER_REDUCTION_AVERAGE) die("Sampler reduction filter %d is not implemented", filter);
++}
+ NVN(nvnSamplerBuilderSetLodSnap, void, NVNsamplerBuilder *b, float v) { (void)b; (void)v; }   // Metal 无对应，忽略 | No Metal equivalent, ignored
+ NVN(nvnSamplerBuilderGetMinMagFilter, void, const NVNsamplerBuilder *b, NVNminFilter *mi, NVNmagFilter *ma) {
+     const samp_par *o = &((const samp_builder_t *)b)->p; *mi = (NVNminFilter)o->minf; *ma = (NVNmagFilter)o->magf;
+@@ -464,6 +524,18 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData
+     OLOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)p, n, n ? (unsigned long long)sd[0].data : 0ull);
+     return 1;
+ }
++// This newer API uses 0x18 bytes per shader stage: the usual data/control pair plus an extension word.
++typedef struct { NVNbufferAddress data; const void *control; uint64_t extension; } shader_data_ext;
++NVN_NOPROTO(nvnProgramSetShadersExt, NVNboolean, NVNprogram *p, int n, const shader_data_ext *stages) {
++    if (n < 0 || n > 6) { LOG("【红】ProgramSetShadersExt 阶段数 %d", n); return 0; }
++    NVNshaderData sd[6];
++    for (int i = 0; i < n; i++) {
++        if (stages[i].extension) { static int said; if (!said++) LOG("[nvn] SetShadersExt extension word %#llx is ignored", (unsigned long long)stages[i].extension); }
++        sd[i] = (NVNshaderData){stages[i].data, stages[i].control};
++    }
++    return h_nvnProgramSetShaders(p, n, sd);
++}
++
+ 
+ // ---------- 同步 / 事件 ----------
+ // ---------- Sync / events ----------
+@@ -691,6 +763,13 @@ NVN(nvnCommandBufferSetViewports, void, NVNcommandBuffer *c, int first, int n, c
+     for (int i = 0; i < n; i++) memcpy(r->v[i], v + 4 * i, 16);
+ }
+ NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) { *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }
++// Replay tracks one scissor rectangle, corresponding to viewport 0.
++NVN(nvnCommandBufferSetScissors, void, NVNcommandBuffer *c, int first, int n, const int *rects) {
++    if (first < 0 || n < 0) die("Invalid scissor range");
++    if (first == 0 && n > 0) h_nvnCommandBufferSetScissor(c, rects[0], rects[1], rects[2], rects[3]);
++    if (n > 1 - first) { static int said; if (!said++) LOG("[nvn] SetScissors uses scissor 0 only (first %d, count %d)", first, n); }
++}
++
+ NVN(nvnCommandBufferSetDepthRange, void, NVNcommandBuffer *c, float n, float f) { *REC(c, OP_DEPTH_RANGE, p_depth_range) = (p_depth_range){n, f}; }
+ NVN(nvnCommandBufferBindProgram, void, NVNcommandBuffer *c, const NVNprogram *p, int stages) {
+     *REC(c, OP_BIND_PROGRAM, p_bind_program) = (p_bind_program){snap_prog(p), stages};
+@@ -714,6 +793,11 @@ NVN(nvnCommandBufferBindVertexBuffers, void, NVNcommandBuffer *c, int first, int
+     if (n < 0 || first + n > 16) { LOG("【红】BindVertexBuffers first=%d n=%d", first, n); return; }
+     p_bind_vbuf *r = RECN(c, OP_BIND_VBUF, p_bind_vbuf, r, n); r->first = first; r->n = n; memcpy(r->r, rg, sizeof *rg * n);
+ }
++NVN(nvnCommandBufferBindVertexBuffer, void, NVNcommandBuffer *c, int i, NVNbufferAddress address, size_t size) {
++    NVNbufferRange range = {address, size};
++    h_nvnCommandBufferBindVertexBuffers(c, i, 1, &range);
++}
++
+ NVN(nvnCommandBufferBindUniformBuffer, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNbufferAddress a, size_t n) {
+     *REC(c, OP_BIND_UBO, p_bind_buf) = (p_bind_buf){st, i, a, n};
+ }
+@@ -730,6 +814,12 @@ static void bind_handles(NVNcommandBuffer *c, int op, int st, int first, int n,
+     if (n < 0 || n > 32) { LOG("【红】绑定句柄数 %d", n); return; }
+     p_bind_handles *r = RECN(c, op, p_bind_handles, h, n); r->stage = st; r->first = first; r->n = n; memcpy(r->h, h, 8 * n);
+ }
++NVN(nvnCommandBufferBindTexture, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNtextureHandle h) {
++    bind_handles(c, OP_BIND_TEX, st, i, 1, &h);
++}
++NVN(nvnCommandBufferBindTextures, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNtextureHandle *h) {
++    bind_handles(c, OP_BIND_TEX, st, first, n, h);
++}
+ // 图像（可写贴图）：句柄 = 贴图池号（GetImageHandle 原样返回；游戏不调 RegisterImage，图像与贴图共用登记）
+ // Image (writable texture): handle = texture pool index (GetImageHandle returns it as-is; the game does not call RegisterImage, images and textures share registration)
+ NVN(nvnCommandBufferBindImages, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNimageHandle *h) {
+@@ -755,6 +845,11 @@ NVN(nvnCommandBufferDrawElementsInstanced, void, NVNcommandBuffer *c, NVNdrawPri
+     int bv, int bi, int inst) {
+     *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, it, n, bv, bi, inst, ib};
+ }
++NVN(nvnCommandBufferDrawElementsBaseVertex, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n,
++    NVNbufferAddress ib, int base_vertex) {
++    h_nvnCommandBufferDrawElementsInstanced(c, pr, it, n, ib, base_vertex, 0, 1);
++}
++
+ NVN(nvnCommandBufferDispatchCompute, void, NVNcommandBuffer *c, int x, int y, int z) {
+     // 跳板是尾跳（br），这里的返回地址就是游戏里的调用点
+     // The thunk is a tail jump (br), so the return address here is the call site in the game
+@@ -1262,6 +1357,7 @@ NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
+     return 1;
+ }
+ NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) { if (((win_t *)w)->interval != v) LOG("[nvn] 游戏设出图间隔 %d → %d", ((win_t *)w)->interval, v); ((win_t *)w)->interval = v; }
++NVN(nvnWindowGetPresentInterval, int, const NVNwindow *w) { return ((const win_t *)w)->interval; }
+ NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
+     win_t *o = (win_t *)w; int v[4] = {x, y, ww, hh};
+     if (memcmp(o->crop, v, sizeof v)) LOG("[nvn] WindowCrop %d,%d %dx%d", x, y, ww, hh);
+@@ -1586,8 +1682,16 @@ static void sleep_until_ns(uint64_t dl) {   // 单调时钟上的绝对时刻 |
+ // 4181 SaveIndicatorPanel entries and capped at 60 fps gives 0, which matches the ground truth), so uncapped is a semantically wrong way to run and must not be used as a criterion / cross-check / default. Unit tests set it directly with nvn_present_config
+ static int g_hz = -1, g_display_mode, g_hz_auto;   // g_hz_auto：有窗口、没用 DM_PRESENT_HZ 钉住——帧率跟着窗口所在屏的刷新率取整除档（每帧重读，换屏即换） | g_hz_auto: has a window and not pinned by DM_PRESENT_HZ; the frame rate takes the evenly dividing tier of the refresh rate of the screen the window is on (re-read every frame, changes with the screen)
+ void nvn_present_config(int hz, int display_mode) { g_hz = hz; g_display_mode = display_mode; g_hz_auto = 0; }
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++static _Atomic int g_touchable_hz;
++void nvn_present_hz(int hz) { atomic_store(&g_touchable_hz, hz); }
++#endif
+ double front_display_refresh(char *name, size_t n);
+ static void present_cfg(const win_t *o) {
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++    int requested = atomic_exchange(&g_touchable_hz, 0);
++    if (requested > 0) { g_hz = requested; g_hz_auto = 0; }
++#endif
+     if (g_hz >= 0) return;
+     // 有窗口仍缺省 display 间隔模式；无窗口缺省 game 模式。环境变量可覆盖固定 60 Hz。
+     // With a window the default is still display interval mode; without a window the default is game mode. Environment variables can override the fixed 60 Hz.
+diff --git a/dm/gfx/tools/dmsh_xlate/Program.cs b/dm/gfx/tools/dmsh_xlate/Program.cs
+index 9037403..6d6a7b0 100644
+--- a/dm/gfx/tools/dmsh_xlate/Program.cs
++++ b/dm/gfx/tools/dmsh_xlate/Program.cs
+@@ -10,11 +10,11 @@
+ // Original Switch shaders (Maxwell machine code) → SPIR-V (the Ryujinx.Graphics.Shader translator), for route B's offline metallib build.
+ // Difference from Ryujinx.ShaderTools: the translator's "queries" are answered truthfully rather than always with defaults -
+ //   texture type / image format / vertex attribute type / fragment output type / compute thread group size come from the job file (given by the PC reflection paired via the mapping table; same slot number = same resource);
+-//   window origin upper-left, depth 0..1 (measured from the game: nvnDeviceSetWindowOriginMode / SetDepthMode).
++//   window origin and Y-negation are supplied per game; depth is 0..1.
+ // Usage: dmsh_xlate <job.json> <output dir>
+ //   Job: [{ "key", "stage": "vs|ps|cs", "code": machine code file (graphics = 0x50-byte SPH + instructions, compute = instructions),
+ //           "tex": { "slot": "2d|2darray|cube|cubearray|3d|buffer|1d|1darray|2dms|2dmsarray", ... }, "img": { "slot": { "type", "fmt" } },
+-//           "attr": { "location": "float|sint|uint" }, "fout": { "target": "float|sint|uint" }, "local": [x, y, z] }]
++//           "attr": { "location": "float|sint|uint" }, "fout": { "target": "float|sint|uint" }, "local": [x, y, z], "y_negate": bool }]
+ //   Output: <key>.spv and <key>.res.json (offsets of storage buffer slots in c0, etc.; decoding texture handle → slot number is done in the script that builds the metallib)
+ using Ryujinx.Common.Memory;
+ using Ryujinx.Graphics.Shader;
+@@ -90,7 +90,7 @@ static class SwshXlate
+             if (_job["fout"] is JsonObject f) foreach (var kv in f) fout[int.Parse(kv.Key)] = Attr((string)kv.Value);
+             return new GpuGraphicsState(false, InputTopology.Triangles, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
+                 false, false, false, false /* 深度 0..1 | depth 0..1 */, false, 1f, AlphaTestOp.Always, 0f, attr, false, fout, false,
+-                false /* 不做 Y 取反 | no Y flip */, true /* 原点左上 | origin upper-left */, false);
++                _job["y_negate"] is JsonNode yn && (bool)yn, true /* 原点左上 | origin upper-left */, false);
+         }
+         public bool QueryHostSupportsTextureShadowLod() => true;
+         // 作业 reduced = true：放宽精度——翻译器只给强制精确的运算打 NoContraction（缺省全部打：保持 Maxwell 分开舍入的逐位结果，代价是 MSL 里大量禁优化的 spvFMul 等）
+diff --git a/dm/host/hle_fs.c b/dm/host/hle_fs.c
+index 4090525..eddb1ab 100644
+--- a/dm/host/hle_fs.c
++++ b/dm/host/hle_fs.c
+@@ -143,7 +143,13 @@ static int guest_name(const char *parent, const char *physical, char *out, size_
+     char p[1280]; snprintf(p, sizeof p, "%s/%s", parent, physical);
+     ssize_t k = getxattr(p, FS_GUEST_NAME, out, n - 1, 0, XATTR_NOFOLLOW);
+     if (k >= 0) { out[k] = 0; return 1; }
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++    /* Android shared storage does not support user xattrs. Extracted RomFS
++     * names are physical guest names; internal save storage still uses xattrs. */
++    if (errno != ENOATTR && errno != ENOTSUP && errno != EOPNOTSUPP) return 0;
++#else
+     if (errno != ENOATTR) return 0;
++#endif
+     strlcpy(out, physical, n); return 1;
+ }
+ static int path_component(char *parent, size_t n, const char *name, int create) {
+@@ -171,6 +177,9 @@ static int path_component(char *parent, size_t n, const char *name, int create)
+     if (len + k + 2 > n) { errno = ENAMETOOLONG; return 0; }
+     parent[len] = '/'; memcpy(parent + len + 1, physical, k + 1); return 1;
+ }
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++#include "ss_fs_lookup.inc"
++#endif
+ static int root_path(const char *root, const char *rest, char *out, size_t n) {
+     strlcpy(out, root, n);
+     while (*rest) {
+@@ -238,7 +247,14 @@ static int host_path_ex(const char *p, char *out, size_t n, int *ro, int create)
+             memcpy(part, rest, k); part[k] = 0;
+             if (!strcmp(part, "..")) { errno = ENOENT; return 0; }
+             const char *next = end; while (*next == '/') next++;
+-            if (strcmp(part, ".") && !path_component(out, n, part, create && !*next)) return 0;
++            if (strcmp(part, ".")) {
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++                if (g_mnt[i].ro && !create) {
++                    if (!ss_path_component_ro(out, n, part)) return 0;
++                } else
++#endif
++                if (!path_component(out, n, part, create && !*next)) return 0;
++            }
+             rest = end;
+         }
+         return 1;
+@@ -412,6 +428,7 @@ HLE_FORCE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", "fsp-srv；存档 
+     const char *d = getenv("DM_SAVE");
+     if (!d) die("未设 DM_SAVE：请指向一份存档目录的可写副本");
+     char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;   // 去掉结尾斜杠（.work / .new 拼在同级） | strip trailing slashes (.work / .new are appended at the same level)
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+     stash_seed(dd);
+     low_vision_off(dd);
+     settings_seed(dd); settings_lang_apply(dd);
+@@ -420,6 +437,7 @@ HLE_FORCE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", "fsp-srv；存档 
+     // Rule files for the loot filter (the game loads them at startup; dm_lootfilter.c registers this hook from a constructor; it is null in unit tests that link only hle_fs.c). Same switch as settings_seed:
+     // written by default on iOS; not written under the Mac host's parity gate (saves must match the device ground truth file by file)
+     { const char *e = getenv("DM_TOUCH_DEFAULTS"); if (g_dm_mount_seed_hook && (e ? strcmp(e, "0") != 0 : TARGET_OS_IPHONE)) g_dm_mount_seed_hook(dd); }
++#endif
+     return mount_ex(name, dd, 0, 1);
+ }
+ void (*g_dm_pre_commit_hook[5])(const char *workdir);   // 提交前调（工作目录）：宿主旁路文件按工作目录里的存档内容核对后再写（[0] 个人仓库多页 dm_pages.c、[2] 百宝囊 dm_pouch.c、[1] 编年史仓库 dm_vault.c、[3] 秘境进度 dm_rift.c、[4] iCloud 收件箱并回 dm_cloudmerge.c） | Called before commit (working directory): host side files are checked against the save content in the working directory before being written ([0] personal stash multi-page dm_pages.c, [2] pouch dm_pouch.c, [1] Chronicle stash dm_vault.c, [3] Rift progress dm_rift.c, [4] iCloud inbox merge dm_cloudmerge.c)
+@@ -548,6 +566,7 @@ ssize_t dm_data_pread(int fd, void *buf, size_t n, off_t off) {   // 语义同 p
+     }
+     return (ssize_t)done;
+ }
++void (*g_dm_fs_open_hook)(const char *path);
+ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Result, h_fs_OpenFile, uint64_t *out, const char *path, int mode) {
+     HP(path);
+     if (mode & (MODE_WRITE | MODE_APPEND)) RW();
+@@ -563,19 +582,30 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
+     fslog_init();
+     if (g_fslog && fd < 4096) { pthread_mutex_lock(&g_fslog_lock); free(g_fdpath[fd]); g_fdpath[fd] = strdup(path); pthread_mutex_unlock(&g_fslog_lock); }
+     if (g_flag.fs) LOG("fs open [%.2fs] %s mode=%d → fd %d", (now_ns() - g_t0_ns) / 1e9, path, mode, fd);
++    if (g_dm_fs_open_hook && !(mode & (MODE_WRITE | MODE_APPEND))) g_dm_fs_open_hook(path);
+     return RES_OK;
+ }
+ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", Result, h_fs_ReadFile, size_t *out, uint64_t h, int64_t off, void *buf, size_t sz) {
+     if (!h) { *out = 0; return RES_FAIL; }   // 文件句柄就是 fd，0 是标准输入、不会是游戏打开的文件：打开失败后照用的空句柄 | A file handle is an fd; 0 is standard input and never a file the game opened: it is the null handle the game keeps using after a failed open
+     size_t got = 0; uint64_t t0 = g_flag.bootprof ? now_ns() : 0;
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++    dm_guest_write_prepare(buf, sz);  // Android has no guest snapshot API. Prepare before the read.
++#else
+     dm_guest_host_write_begin(buf, sz);  // prepare 与所有实际读入都在 guard 内，快照不能抢在 store 前观察脏标记 | Guard prepare and all actual reads so snapshots cannot observe a dirty mark before its stores.
++#endif
+     while (got < sz) {
+         ssize_t r = dm_data_pread((int)h, (uint8_t *)buf + got, sz - got, off + got);
+-        if (r < 0) { if (errno == EINTR) continue; dm_guest_host_write_end(); return err_res("pread", "fd"); }
++        if (r < 0) { if (errno == EINTR) continue;
++#ifndef TOUCHABLE_SWITCH_RUNTIME
++            dm_guest_host_write_end();
++#endif
++            return err_res("pread", "fd"); }
+         if (r == 0) break;
+         got += r;
+     }
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+     dm_guest_host_write_end();  // 日志、统计和其他回调都不带 guard | Release before logging, profiling and other callbacks.
++#endif
+     *out = got;
+     if (g_flag.bootprof) dm_prof_add(PROF_FS_READ, now_ns() - t0, got);
+     if (g_fslog) { pthread_mutex_lock(&g_fslog_lock);
+diff --git a/dm/host/hle_svc.c b/dm/host/hle_svc.c
+index c9383df..8fa5038 100644
+--- a/dm/host/hle_svc.c
++++ b/dm/host/hle_svc.c
+@@ -4,6 +4,10 @@
+ // Register convention: inputs w1.. / outputs w0=Result, x1=value (GetInfo / SetHeapSize), consistent with the public Horizon ABI.
+ #include "dm.h"
+ #include "hle.h"
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++#include "touchable_game.h"
++#include "touchable_game_config.h"
++#endif
+ #include <stdatomic.h>
+ #include <sys/mman.h>
+ #include <errno.h>
+@@ -159,18 +163,29 @@ static size_t image_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++)
+ static module_t *mod_named(const char *n) { for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, n)) return &g_mod[i]; return NULL; }
+ static _Atomic unsigned long long g_gheap_last[3];
+ int dm_guest_heap_stat(unsigned long long *total_mb, unsigned long long *free_mb, unsigned long long *maxblk_kb) {
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++    (void)total_mb; (void)free_mb; (void)maxblk_kb;
++    return 0;
++#else
+     size_t current = heap_current_size();
+     module_t *mm = mod_named("main"), *ms = mod_named("sdk"); if (!mm || !ms || !current) return 0;
+     uint8_t *al = mm->base + 0x32137a0; if (!al[0]) return 0;   // 首字节 = 已初始化（sdk+0x2f9898 写） | First byte = initialized (written by sdk+0x2f9898)
+     uint64_t fr = ((uint64_t (*)(void *))(ms->base + 0x2f9d78))(al), mx = ((uint64_t (*)(void *))(ms->base + 0x2f9dbc))(al);
+     *total_mb = current >> 20; *free_mb = fr >> 20; *maxblk_kb = mx >> 10;
+     g_gheap_last[0] = *total_mb; g_gheap_last[1] = *free_mb; g_gheap_last[2] = *maxblk_kb; return 1;
++#endif
+ }
+ // 上次读到的主堆读数（总量 MB、余量 MB、最大可分配块 KB；没读过全 0）。任何线程可调——不进分配器（iOS 壳在主线程上记内存告警那一行用）
+ // The last main-heap readout (total MB, free MB, largest allocatable block KB; all 0 if never read). Callable from any thread - does not enter the allocator (the iOS shell uses it on the main thread for the memory-warning log line)
+ void dm_guest_heap_last(unsigned long long v[3]) { for (int i = 0; i < 3; i++) v[i] = atomic_load(&g_gheap_last[i]); }
+ HLE_FORCE("_ZN2nn3mem17StandardAllocator8AllocateEmm", "照原版分配，只在返回空时报红（原版调用方多处不判空）", void *, hle_stdalloc_allocate, void *self, size_t size, size_t align) {
+-    static void *(*orig)(void *, size_t, size_t); if (!orig) { module_t *ms = mod_named("sdk"); orig = (void *(*)(void *, size_t, size_t))(ms->base + 0x2f9974); }
++    static void *(*orig)(void *, size_t, size_t);
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++    if (!orig && !(orig = (void *(*)(void *, size_t, size_t))guest_sym("_ZN2nn3mem17StandardAllocator8AllocateEmm")))
++        die("The guest does not export StandardAllocator::Allocate");
++#else
++    if (!orig) { module_t *ms = mod_named("sdk"); orig = (void *(*)(void *, size_t, size_t))(ms->base + 0x2f9974); }
++#endif
+     void *p = orig(self, size, align);
+     if (!p && size) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) LOG("【红】游戏堆分配返回空：申请 %zu 字节（对齐 %zu），分配器 %p；上次读数 主堆 %llu MB、余量 %llu MB、最大可分配块 %llu KB", size, align, self,
+         (unsigned long long)g_gheap_last[0], (unsigned long long)g_gheap_last[1], (unsigned long long)g_gheap_last[2]); }
+@@ -212,6 +227,11 @@ static void map_add(uint64_t b, uint64_t n, uint64_t src, uint32_t st) {
+     pthread_mutex_unlock(&g_map_lock);
+ }
+ static void map_del(int i) { pthread_mutex_lock(&g_map_lock); g_map[i] = g_map[--g_nmap]; pthread_mutex_unlock(&g_map_lock); }
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++#define RESERVE g_reserve
++#include "ss_memory.inc"
++#undef RESERVE
++#endif
+ 
+ int svc_thread(int num, uint64_t *regs);   // hle_thread.c：线程与同步类 | hle_thread.c: thread and synchronization kind
+ 
+@@ -219,7 +239,11 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
+     { void hlecount_svc(int); hlecount_svc(num); }   // DM_HLECOUNT：svc 按号计数 | DM_HLECOUNT: svc counts by number
+     mem_init();
+     if (svc_thread(num, regs)) return regs[0];
+-    { uint64_t svc_host_call(int, uint64_t *); if (num >= 0x80 && svc_host_call(num, regs)) return regs[0]; }   // 0x80 起：剪口约定的宿主调用（hle_tact.c） | from 0x80: host calls by cut convention (hle_tact.c)
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++    if (num >= 0x80 && touchable_game_host_call(num, regs)) return regs[0];
++#else
++    { uint64_t svc_host_call(int, uint64_t *); if (num >= 0x80 && svc_host_call(num, regs)) return regs[0]; }
++#endif
+     switch (num) {
+     case 0x01: {  // SetHeapSize(out_addr*, size)  → x1 = heap base
+ #ifdef __ANDROID__
+@@ -300,6 +324,9 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
+         int k;
+         if (a >= g_heap && a < g_heap + current) { base=(uint64_t)g_heap; size=current; state=5/*Heap*/; perm=3; }
+         else if ((k = map_find(addr, 1))) { base=g_map[k-1].base; size=g_map[k-1].size; state=g_map[k-1].state; perm=3; }
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++        else if (a >= g_alias && a < g_alias + g_alias_cap) ss_alias_query(addr, &base, &size, &state, &perm);
++#endif
+         else if (a >= g_as && a < g_as + g_reserve) {   // 空闲：到相邻映射/堆边界为止 | free: up to the adjacent mapping/heap boundary
+             uint64_t lo = (uint64_t)g_as, hi = (uint64_t)g_as + g_reserve;
+             if (a >= g_heap) lo = (uint64_t)g_heap + current;
+@@ -321,11 +348,20 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
+             // This Diablo build does not call GetCurrentStackInfo (main / subsdk0 do not import it and the SDK has no internal call site; the host reaches the main menu with 12 different environment padding lengths), so it was never hit; reporting "one page" is wrong in itself, so fix it anyway.
+             uint64_t top = (uint64_t)pthread_get_stackaddr_np(pthread_self()), ssz = pthread_get_stacksize_np(pthread_self());
+             if (addr < top && addr >= top - ssz) { base = top - ssz; size = ssz; state = 0xB/*Stack*/; perm = 3; }
+-            else { base=addr & ~0xFFFull; size=0x1000; state=3/*Code*/; perm=5; } }
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++            else ss_external_query(addr, &base, &size, &state, &perm);
++#else
++            else { base=addr & ~0xFFFull; size=0x1000; state=3/*Code*/; perm=5; }
++#endif
++        }
+         if (mi) { uint64_t *m=(uint64_t*)mi; m[0]=base; m[1]=size; ((uint32_t*)mi)[4]=state; ((uint32_t*)mi)[5]=0; ((uint32_t*)mi)[6]=perm; ((uint32_t*)mi)[7]=0; ((uint32_t*)mi)[8]=0; }
+         regs[0] = 0; regs[1] = 0; return 0;
+     }
+     case 0x2C: case 0x2D: {  // MapPhysicalMemory / UnmapPhysicalMemory(addr, size)：只许在 alias 区内（SDK 的 VammManager 用） | MapPhysicalMemory / UnmapPhysicalMemory(addr, size): only allowed inside the alias region (used by the SDK's VammManager)
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++        regs[0] = ss_physical_memory(regs[0], regs[1], num == 0x2c);
++        return regs[0];
++#else
+         uint8_t *a = (uint8_t *)regs[0]; size_t size = regs[1];
+         if (a < g_alias || a + size > g_alias + g_alias_cap) { LOG("SVC %#x 越出 alias 区 %p+%#zx", num, a, size); regs[0] = 0xD401; return 0; }
+         int rc = num == 0x2C ? mprotect(a, size, PROT_READ | PROT_WRITE)
+@@ -333,6 +369,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
+         if (rc) die("SVC %#x mprotect %p+%#zx errno=%d", num, a, size, errno);
+         if (g_flag.svc) LOG("%sPhysicalMemory %p+%#zx", num == 0x2C ? "Map" : "Unmap", a, size);
+         regs[0] = 0; return 0;
++#endif
+     }
+     case 0x26: {  // Break(reason, ptr, size)：SDK 致命中止 | Break(reason, ptr, size): SDK fatal abort
+         uint32_t res = (regs[1] && regs[2] >= 4) ? *(uint32_t *)regs[1] : 0;
+@@ -364,7 +401,11 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
+         case I_SysResTotal: v = 0x2000000; break; case I_SysResUsed: v = 0x400000; break;
+         case I_DebuggerAttached: v = 0; break;
+         case I_RandomEntropy: { uint64_t dm_entropy64(void); v = dm_entropy64(); break; }   // DM_DETCLOCK 开时为确定流（hle_os.c） | a deterministic stream when DM_DETCLOCK is on (hle_os.c)
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++        case I_ProgramId: v = TOUCHABLE_GAME_TITLE_ID; break;
++#else
+         case I_ProgramId: v = 0x0100726014352000ull; break;
++#endif
+         case I_IsApplication: v = 1; break;
+         case I_UserExcAddr: v = 0; break;
+         default: v = 0; break;
+@@ -372,6 +413,9 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
+         regs[0] = 0; regs[1] = v; return 0;
+     }
+     default:
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++        die("Unsupported SVC %#x x0=%#llx x1=%#llx x2=%#llx", num, regs[0], regs[1], regs[2]);
++#endif
+         if (!g_seen[num & 0xff]) { g_seen[num & 0xff] = 1; LOG("SVC %#x x0=%#llx x1=%#llx x2=%#llx (占位返回成功)", num, regs[0], regs[1], regs[2]); }
+         regs[0] = 0; return 0;
+     }
+diff --git a/dm/host/hle_swkbd.c b/dm/host/hle_swkbd.c
+index f0dcb15..3e91d17 100644
+--- a/dm/host/hle_swkbd.c
++++ b/dm/host/hle_swkbd.c
+@@ -63,6 +63,7 @@ size_t swkbd_u8_to_u16(const char *s, size_t max_units, uint16_t *out, size_t ca
+     return o;
+ }
+ 
++#ifndef TOUCHABLE_SWITCH_RUNTIME
+ // 核心（单测直接调）：从 arg 解出显示参数，经 input 取得用户文本（返回 1 确定 / 0 取消 / -1 无窗口），按 arg 约定回写 out
+ // 游戏的离线角色名规则（原映像，逐字节判）：2–15 字节、首尾必须「字母」、'-' '_' 合计最多一个，其余必须是字母。原版只认 ASCII 字母；
+ // hle_charname.c 把 ≥0x80 的字节也放行（中文名），所以规则变成：英文字母或汉字，UTF-8 合计不超过 15 字节（汉字每个 3 字节，最多 5 个）。
+@@ -115,3 +116,4 @@ HLE_FORCE("_ZN2nn5swkbd12ShowKeyboardEPNS0_6StringERKNS0_15ShowKeyboardArgE", "
+           Result, h_swkbd_Show, void *out, const void *arg) {
+     return swkbd_show(out, arg, front_text_input);
+ }
++#endif
+diff --git a/dm/host/loader.c b/dm/host/loader.c
+index 8294c69..eb0fc31 100644
+--- a/dm/host/loader.c
++++ b/dm/host/loader.c
+@@ -164,9 +164,15 @@ static void *force_lookup(const char *name) {
+ static void force_check(void) {
+     int bad = 0;
+     for (unsigned i = 0; i < g_nforce; i++)
+-        if (!g_force_hits[i]) { LOG("强制接管条目无任何引用：%s", g_force[i].name); bad = 1; }
++        if (!g_force_hits[i]) {
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++            if (g_flag.imports) LOG("Unused optional host interface: %s", g_force[i].name);
++#else
++            LOG("强制接管条目无任何引用：%s", g_force[i].name); bad = 1;
++#endif
++        }
+     if (bad) die("强制接管清单有误");
+-    LOG("force: %u 条全部命中", g_nforce);
++    LOG("force: %u registered interfaces", g_nforce);
+ }
+ 
+ // 读改写器表头（段边界、槽号）；表头以外有任何行即旧版产物（装载期改代码），拒绝
+@@ -229,13 +235,29 @@ static void register_gates(module_t *m, const char *dir) {
+ 
+ static void relocate(module_t *m) {
+     uint64_t rela = 0, relasz = 0, jmprel = 0, pltsz = 0;
++    uint64_t relr = 0, relrsz = 0, relrent = 8;
+     for (const Elf64_Dyn *d = m->dyn; d->d_tag; d++) switch (d->d_tag) {
+         case DT_RELA: rela = d->d_un.d_ptr; break;
+         case DT_RELASZ: relasz = d->d_un.d_val; break;
+         case DT_JMPREL: jmprel = d->d_un.d_ptr; break;
+         case DT_PLTRELSZ: pltsz = d->d_un.d_val; break;
++        case 35: relrsz = d->d_un.d_val; break;
++        case 36: relr = d->d_un.d_ptr; break;
++        case 37: relrent = d->d_un.d_val; break;
+     }
+     int cnt[3] = {0};
++    if (relrsz) {
++#ifdef TOUCHABLE_SWITCH_RUNTIME
++        extern int ss_apply_relr(uint8_t *, size_t, size_t, uint64_t, uint64_t, size_t *);
++        size_t count = 0;
++        if (relrent != 8 || ss_apply_relr(m->base, m->size,
++                (m->text_end + 0x3fff) & ~0x3fffull, relr, relrsz, &count))
++            die("%s: invalid RELR table", m->name);
++        LOG("%s: RELR applied=%zu", m->name, count);
++#else
++        die("%s: RELR needs a supported decoder", m->name);
++#endif
++    }
+     const Elf64_Rela *tabs[2] = {(const Elf64_Rela *)(m->base + rela), (const Elf64_Rela *)(m->base + jmprel)};
+     uint64_t sizes[2] = {relasz, pltsz};
+     for (int t = 0; t < 2; t++)
 diff --git a/dm/verify/equiv.py b/dm/verify/equiv.py
 index a41a199..d864782 100644
 --- a/dm/verify/equiv.py

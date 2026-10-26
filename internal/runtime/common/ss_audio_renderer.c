@@ -5,14 +5,20 @@
  * SubMixType, FinalMixType, MemoryPoolType, I3dl2ReverbType, DeviceSinkType) starts with one
  * pointer slot; the host writes only that slot. AudioRendererHandle is 16 bytes passed in x0/x1.
  *
- * Output follows hle_audio.c: CoreAudio on iOS or with DM_AUDIO=1, otherwise a silent sink that
- * consumes frames in real time. A server thread renders 5 ms frames into a ring and signals the
- * renderer event once per frame, as the console renderer does. */
+ * Output follows hle_audio.c: AAudio on Android, CoreAudio on iOS or with DM_AUDIO=1,
+ * otherwise a silent sink that consumes frames in real time. A server thread renders 5 ms
+ * frames into a ring and signals the renderer event once per frame, as the console renderer does. */
 #include "hle.h"
 #include "ss_audren.h"
+#ifdef __ANDROID__
+#include <aaudio/AAudio.h>
+#include <errno.h>
+#include <semaphore.h>
+#else
 #include <AudioToolbox/AudioToolbox.h>
 #include <TargetConditionals.h>
 #include <dispatch/dispatch.h>
+#endif
 #include <stdatomic.h>
 #include <unistd.h>
 
@@ -26,19 +32,68 @@ typedef struct {
     _Atomic int started, running, sink_running;
     _Atomic uint32_t read, write, want;
     int16_t ring[RING_FRAMES * 2];
+#ifdef __ANDROID__
+    sem_t wake;
+#else
     dispatch_semaphore_t wake;
+#endif
     pthread_t server, sink;
     pthread_mutex_t lock;     /* start, stop, suspend */
+#ifdef __ANDROID__
+    AAudioStream *unit;
+#else
     AudioUnit unit;
+#endif
     int unit_running, suspended;
 } ar_device;
 
 typedef struct { void *address; uint64_t size; int attach, attached; } ar_pool;
 
 static ar_device *g_device;
+static pthread_mutex_t g_device_lock = PTHREAD_MUTEX_INITIALIZER; /* suspend versus close */
 static _Atomic float g_handheld_volume = 1;
 
-static int real_audio(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : TARGET_OS_IPHONE; }
+static int real_audio(void) {
+    const char *e = getenv("DM_AUDIO");
+    if (e) return atoi(e) != 0;
+#ifdef __ANDROID__
+    return 1;
+#else
+    return TARGET_OS_IPHONE;
+#endif
+}
+
+static void wake_init(ar_device *device) {
+#ifdef __ANDROID__
+    if (sem_init(&device->wake, 0, 0)) die("Cannot create the audio renderer semaphore");
+#else
+    device->wake = dispatch_semaphore_create(0);
+    if (!device->wake) die("Cannot create the audio renderer semaphore");
+#endif
+}
+static void wake_signal(ar_device *device) {
+#ifdef __ANDROID__
+    sem_post(&device->wake);
+#else
+    dispatch_semaphore_signal(device->wake);
+#endif
+}
+static void wake_wait(ar_device *device) {
+#ifdef __ANDROID__
+    int result;
+    do { result = sem_wait(&device->wake); } while (result && errno == EINTR);
+    if (result) die("Cannot wait for the audio renderer semaphore");
+#else
+    dispatch_semaphore_wait(device->wake, dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC));
+#endif
+}
+static void wake_destroy(ar_device *device) {
+#ifdef __ANDROID__
+    sem_destroy(&device->wake);
+#else
+    dispatch_release(device->wake);
+#endif
+}
 static void *slot_get(const void *object) { return object ? *(void *const *)object : NULL; }
 static void slot_put(void *object, void *value) { dm_guest_write_prepare(object, sizeof(void *)); *(void **)object = value; }
 static ar_device *device_of(uint64_t handle) {
@@ -78,7 +133,7 @@ static void *server_main(void *argument) {
     FILE *dump = dump_open(device->rate);
     uint64_t dumped = 0;
     while (atomic_load_explicit(&device->running, memory_order_acquire)) {
-        dispatch_semaphore_wait(device->wake, dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC));
+        wake_wait(device);
         while (atomic_load_explicit(&device->started, memory_order_acquire) &&
                ring_fill(device) + (uint32_t)device->frame <= atomic_load_explicit(&device->want, memory_order_relaxed)) {
             ss_ar_renderer *renderer = atomic_load_explicit(&device->renderer, memory_order_acquire);
@@ -114,15 +169,23 @@ static void consume(ar_device *device, int16_t *out, uint32_t frames) {
     uint32_t want = frames + (uint32_t)device->frame;
     if (want > atomic_load_explicit(&device->want, memory_order_relaxed) && want < RING_FRAMES / 2)
         atomic_store_explicit(&device->want, want, memory_order_relaxed);
-    dispatch_semaphore_signal(device->wake);
+    wake_signal(device);
 }
 
+#ifdef __ANDROID__
+static aaudio_data_callback_result_t unit_render(AAudioStream *stream, void *context, void *data, int32_t frames) {
+    (void)stream;
+    consume(context, data, (uint32_t)frames);
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+#else
 static OSStatus unit_render(void *context, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *time, UInt32 bus,
                             UInt32 frames, AudioBufferList *buffers) {
     (void)flags; (void)time; (void)bus;
     consume(context, buffers->mBuffers[0].mData, frames);
     return noErr;
 }
+#endif
 
 static void *silent_sink(void *argument) {
     ar_device *device = argument;
@@ -138,6 +201,26 @@ static void *silent_sink(void *argument) {
 }
 
 static void unit_open(ar_device *device) {
+#ifdef __ANDROID__
+    AAudioStreamBuilder *builder = NULL;
+    aaudio_result_t result = AAudio_createStreamBuilder(&builder);
+    if (result != AAUDIO_OK) die("Cannot create the audio renderer AAudio builder: %s", AAudio_convertResultToText(result));
+    AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
+    AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
+    AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_I16);
+    AAudioStreamBuilder_setSampleRate(builder, device->rate);
+    AAudioStreamBuilder_setChannelCount(builder, 2);
+    AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_GAME);
+    AAudioStreamBuilder_setDataCallback(builder, unit_render, device);
+    result = AAudioStreamBuilder_openStream(builder, &device->unit);
+    AAudioStreamBuilder_delete(builder);
+    if (result != AAUDIO_OK) die("Cannot open the audio renderer AAudio output: %s", AAudio_convertResultToText(result));
+    if (AAudioStream_getSampleRate(device->unit) != device->rate ||
+        AAudioStream_getChannelCount(device->unit) != 2 ||
+        AAudioStream_getFormat(device->unit) != AAUDIO_FORMAT_PCM_I16)
+        die("AAudio negotiated an unsupported audio renderer PCM format");
+#else
     AudioComponentDescription description = {.componentType = kAudioUnitType_Output,
 #if TARGET_OS_IPHONE
         .componentSubType = kAudioUnitSubType_RemoteIO,
@@ -154,7 +237,37 @@ static void unit_open(ar_device *device) {
     if (AudioUnitSetProperty(device->unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &format, sizeof(format)) ||
         AudioUnitSetProperty(device->unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &callback, sizeof(callback)) ||
         AudioUnitInitialize(device->unit)) die("Cannot configure the audio renderer output unit");
+#endif
 }
+
+/* Android start/stop requests are asynchronous. Never hand the ring to the silent sink
+ * until AAudio has stopped its callback; the ring has exactly one consumer. */
+#ifdef __ANDROID__
+static aaudio_result_t unit_wait(ar_device *device, aaudio_stream_state_t target) {
+    for (unsigned i = 0; i < 10; ++i) {
+        aaudio_stream_state_t state = AAudioStream_getState(device->unit), next;
+        if (state == target) return AAUDIO_OK;
+        if (state == AAUDIO_STREAM_STATE_DISCONNECTED) return AAUDIO_ERROR_DISCONNECTED;
+        aaudio_result_t result = AAudioStream_waitForStateChange(device->unit, state, &next, 100000000);
+        if (result != AAUDIO_OK && result != AAUDIO_ERROR_TIMEOUT) return result;
+    }
+    return AAUDIO_ERROR_TIMEOUT;
+}
+static void unit_close(ar_device *device) {
+    if (!device->unit) return;
+    aaudio_result_t result = AAudioStream_close(device->unit);
+    if (result != AAUDIO_OK) die("Cannot close the audio renderer AAudio output: %s", AAudio_convertResultToText(result));
+    device->unit = NULL;
+    device->unit_running = 0;
+}
+#else
+static void unit_close(ar_device *device) {
+    if (!device->unit) return;
+    AudioUnitUninitialize(device->unit);
+    AudioComponentInstanceDispose(device->unit);
+    device->unit = NULL;
+}
+#endif
 
 static void sink_start(ar_device *device) {
     if (atomic_exchange(&device->sink_running, 1)) return;
@@ -166,26 +279,45 @@ static void sink_stop(ar_device *device) {
 /* Called with device->lock held. */
 static void output_start(ar_device *device) {
     if (device->unit && !device->suspended) {
+#ifdef __ANDROID__
+        aaudio_result_t status = AAudioStream_requestStart(device->unit);
+        if (status == AAUDIO_OK) status = unit_wait(device, AAUDIO_STREAM_STATE_STARTED);
+        /* A failed asynchronous start may still have dispatched a callback. Close is the
+         * quiescence barrier before the silent consumer can touch the ring. */
+        if (status != AAUDIO_OK) unit_close(device);
+#else
         OSStatus status = AudioOutputUnitStart(device->unit);
+#endif
         if (!status) { device->unit_running = 1; return; }
         LOG("Audio renderer output did not start (%d). The silent sink keeps the game clock running.", (int)status);
     }
     sink_start(device);
 }
 static void output_stop(ar_device *device) {
-    if (device->unit_running) { AudioOutputUnitStop(device->unit); device->unit_running = 0; }
+    if (device->unit_running) {
+#ifdef __ANDROID__
+        aaudio_result_t status = AAudioStream_requestStop(device->unit);
+        if (status == AAUDIO_OK) status = unit_wait(device, AAUDIO_STREAM_STATE_STOPPED);
+        if (status != AAUDIO_OK) unit_close(device);
+#else
+        AudioOutputUnitStop(device->unit);
+#endif
+        device->unit_running = 0;
+    }
     sink_stop(device);
 }
 
 static void renderer_suspend(int on) {
+    pthread_mutex_lock(&g_device_lock);
     ar_device *device = g_device;
-    if (!device) return;
+    if (!device) { pthread_mutex_unlock(&g_device_lock); return; }
     pthread_mutex_lock(&device->lock);
     if (device->suspended != on) {
         device->suspended = on;
         if (atomic_load(&device->started)) { output_stop(device); output_start(device); }
     }
     pthread_mutex_unlock(&device->lock);
+    pthread_mutex_unlock(&g_device_lock);
 }
 
 /* ---------- Renderer ---------- */
@@ -198,6 +330,7 @@ HLE_FORCE("_ZN2nn5audio30GetAudioRendererWorkBufferSizeERKNS0_22AudioRendererPar
 HLE_FORCE("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm",
           "audren service -> host mixer", Result, ss_ar_open, uint64_t *handle, void *event, const int32_t *parameter, void *work, size_t size) {
     (void)work; (void)size;
+    pthread_mutex_lock(&g_device_lock);
     if (g_device) die("Only one audio renderer is supported");
     ar_device *device = calloc(1, sizeof(*device));
     if (!device) die("Cannot allocate the audio renderer");
@@ -206,7 +339,7 @@ HLE_FORCE("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11S
         die("Unsupported audio renderer format: %d Hz, %d samples", device->rate, device->frame);
     device->event = event;
     if (event) hle_bind_system_event(event, 1);
-    device->wake = dispatch_semaphore_create(0);
+    wake_init(device);
     pthread_mutex_init(&device->lock, NULL);
     atomic_store(&device->want, (uint32_t)device->frame * 2);
     atomic_store(&device->running, 1);
@@ -217,7 +350,13 @@ HLE_FORCE("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11S
     dm_guest_write_prepare(handle, 16);
     handle[0] = (uintptr_t)device; handle[1] = 0;
     LOG("audio::OpenAudioRenderer %d Hz, %d samples, voices %d, submixes %d, mix buffers %d, effects %d, %s",
-        device->rate, device->frame, parameter[4], parameter[3], parameter[2], parameter[6], device->unit ? "CoreAudio" : "silent sink");
+        device->rate, device->frame, parameter[4], parameter[3], parameter[2], parameter[6],
+#ifdef __ANDROID__
+        device->unit ? "AAudio" : "silent sink");
+#else
+        device->unit ? "CoreAudio" : "silent sink");
+#endif
+    pthread_mutex_unlock(&g_device_lock);
     return RES_OK;
 }
 
@@ -227,7 +366,7 @@ HLE_FORCE("_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE", "Start 
     pthread_mutex_lock(&device->lock);
     if (!atomic_exchange(&device->started, 1)) output_start(device);
     pthread_mutex_unlock(&device->lock);
-    dispatch_semaphore_signal(device->wake);
+    wake_signal(device);
     return RES_OK;
 }
 
@@ -240,16 +379,19 @@ HLE_FORCE("_ZN2nn5audio17StopAudioRendererENS0_19AudioRendererHandleE", "Stop th
 }
 
 HLE_FORCE("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", "Close the host mixer", void, ss_ar_close, uint64_t handle, uint64_t unused) {
+    pthread_mutex_lock(&g_device_lock);
     ar_device *device = device_of(handle);
     ss_ar_stop(handle, unused);
     atomic_store(&device->running, 0);
-    dispatch_semaphore_signal(device->wake);
+    wake_signal(device);
     pthread_join(device->server, NULL);
     g_ss_audio_suspend_hook = NULL;
     g_device = NULL;
-    if (device->unit) { AudioUnitUninitialize(device->unit); AudioComponentInstanceDispose(device->unit); }
+    unit_close(device);
+    wake_destroy(device);
     pthread_mutex_destroy(&device->lock);
     free(device);
+    pthread_mutex_unlock(&g_device_lock);
 }
 
 HLE_FORCE("_ZN2nn5audio29InitializeAudioRendererConfigEPNS0_19AudioRendererConfigERKNS0_22AudioRendererParameterEPvm",

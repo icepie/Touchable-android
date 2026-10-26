@@ -9,6 +9,10 @@
 #include <mach/mach_time.h>
 #include <mach/thread_policy.h>
 #include <pthread.h>
+#ifdef __ANDROID__
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#endif
 
 void hle_bind_system_event(void *event, int auto_clear);
 void hle_signal_system_event(void *event);
@@ -43,12 +47,18 @@ void ss_display_set_hz(int hz) {
     LOG("Display event rate %d Hz -> %d Hz", old, hz);
 }
 static void vsync_policy(uint64_t period) {
+#ifdef __ANDROID__
+    (void)period;
+    if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), -8))
+        LOG("Display thread priority unchanged: %s", strerror(errno));
+#else
     thread_time_constraint_policy_data_t policy = {
         .period = (uint32_t)period, .computation = (uint32_t)(period / 100),
         .constraint = (uint32_t)(period / 10), .preemptible = 1};
     if (thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
                           (thread_policy_t)&policy, THREAD_TIME_CONSTRAINT_POLICY_COUNT) != KERN_SUCCESS)
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
 }
 /* The game waits for this event once per frame, so its period is the frame rate.
    Wake on an absolute schedule: a relative sleep adds its wake-up delay to

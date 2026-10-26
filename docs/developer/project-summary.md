@@ -1,16 +1,20 @@
 # Project summary
 
-Snapshot date: 2026-10-18. Game coverage below comes from existing game records. See [the reorganization record](reorganization.md) for the new build and launcher checks.
+Snapshot date: 2026-10-23. Game coverage below comes from existing game records. See [the reorganization record](reorganization.md) for the new build and launcher checks.
 
 ## Purpose and execution model
 
-Touchable adapts user-provided Switch games for iPhone and iPad. A Mac host supports development and diagnosis. Each game needs its own adapter and verified module profile.
+Touchable adapts user-provided Switch games for iPhone and iPad. A Mac host supports development and diagnosis. An experimental Android host for Rhythm Heaven now renders a device warning screen. Linux x64 is not a supported host target: the active modules are AArch64 and the current host backends are Apple or Android. A Linux target needs an ARM64 emulator or JIT and Linux Vulkan/audio/window backends. Gameplay is not verified. Each game needs its own adapter and verified module profile.
 
 The project was renamed from Nitenphone. The launcher is `Touchable.command`. On 2026-10-20 the workspace, local state, Bundle IDs, and code identifiers also changed to Touchable. The installed apps keep the previous Bundle IDs until the next install. See [the rename record](project-rename.md).
 
 The host loads rewritten ARM64 NSO modules. The runtime supplies Switch services, memory, threads, files, input, audio, and graphics interfaces. The graphics layer translates NVN operations to Metal. Shader tools produce Metal libraries before the app build.
 
 The upstream host supplies the loader. The Switch `rtld` module is checked as input, but it is not executed. The signal bridge handles registered indirect branches and stack operations. CPU checks do not establish full game compatibility.
+
+The Android experiment uses the pinned akari-sora host in `.touchable/dependencies/akari-android/` and its recorded changes in `internal/patches/akari-android.patch`. `internal/tools/build_android.py --game rhythm-heaven --embedded` selects the game's two rewritten modules and shared runtime sources. Android uses NVN/Vulkan and AAudio, not the iOS Metal and CoreAudio backends. The APK starts on a Redmi K20 Pro Premium with pushed local RomFS and shader cache. Turnip selects shader subgroup 64, the guest enters `nnMain`, AudioRenderer opens, and Vulkan renders the game's warning and title screens. The prior black picture came from incorrectly decoding immediate texture handles; the device probe now shows bound textures and nonzero output. Touches advanced the warning, title, and narration setting to the TV calibration introduction. Timing calibration, rhythm gameplay, audible output, and save/load remain unverified. Do not distribute the embedded APK: it contains user-provided game code. See [the Rhythm Heaven record](../../internal/games/rhythm-heaven/README.md).
+
+The later 2026-10-23 Android origin fix also renders the start-menu labels upright. Lower-left offscreen targets retain bottom-up rows. The display blit alone flips them. A Redmi K20 Pro Premium check covers the warning, title, and start-menu heading, labels, and artwork. Temporary per-draw orientation logging was removed. This is not a gameplay or timing-calibration result.
 
 ```mermaid
 flowchart LR
@@ -81,6 +85,7 @@ Known limits include unconfirmed score-digit behavior after the block-height fix
 | `internal/games/<id>/runtime/` | Game hooks, fixed addresses, and engine-specific behavior |
 | `internal/runtime/common/` | Shared host entry, signal bridge, Switch services, input, audio, display calculation, and haptics |
 | `internal/platform/ios/` | Shared app lifecycle, screen output, touch input, audio session, and Core Haptics |
+| `internal/platform/android/` | Android touch, gamepad vibration, and host lifecycle bridge for the experimental port |
 | `internal/platform/ios/probe/` | Native ARM64 signal bridge test app; Bundle ID `com.mmmz.TouchableCPUProbe` |
 | `internal/tools/workspace.py` | Game registry loading, path isolation, identity checks, and adapter state checks |
 | `internal/tools/` | Preparation, analysis, rewrite, shaders, build generation, host control, and packaging |
